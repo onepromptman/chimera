@@ -1,0 +1,43 @@
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Secrets ----------------------------------------------------------------
+# Never commit credentials. The package itself holds no tokens.
+.env
+.env.*
+!.env.example
+.mcp.json
+*.pem
+*.key
+
+# --- Runtime state ----------------------------------------------------------
+# The memory DB lives outside the repo by default ($CHIMERA_DB_PATH), but
+# ignore a local one so an in-repo override never gets committed.
+*.db
+*.sqlite
+*.sqlite3
+
+# Session telemetry written by the advisory router hook. Rotate it into
+# audits/ with scripts/rotate_router_audit.py, which strips it to metadata.
+.claude/telemetry/
+
+# Live task records and their artifacts.
+tasks/
+
+# --- Private working zones --------------------------------------------------
+# Anything under these paths stays local. Keep your own material here rather
+# than anywhere tracked; the protection is the path, so where you write
+# matters. See README "Keeping private content out of the repo".
+private/
+scratch/
+wip/
+flows/*/output/

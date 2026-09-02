@@ -1,0 +1,26 @@
+{
+  "permissions": {
+    "defaultMode": "acceptEdits"
+  },
+  "extraKnownMarketplaces": {
+    "n8n-io": {
+      "source": { "source": "github", "repo": "n8n-io/skills" }
+    }
+  },
+  "enabledPlugins": {
+    "n8n-skills@n8n-io": true
+  },
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/router-enforcer.py\""
+          }
+        ]
+      }
+    ]
+  }
+}

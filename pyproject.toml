@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools==83.0.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "chimera"
+version = "7.1.1"
+description = "Chimera v7 — git-durable background task engine driven by Claude Code sessions"
+requires-python = ">=3.11"
+dependencies = [
+    # Bumped from ==2.11.7: that release's pydantic-core ships no cp314 wheel,
+    # forcing a failing Rust source build on Python 3.14. 2.13.4 has a prebuilt
+    # 3.14 wheel. Exact-pin discipline (Security Rule #8) preserved.
+    "pydantic==2.13.4",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest==9.0.3",
+    "ruff==0.9.6",
+    "mypy==1.15.0",
+]
+
+[project.scripts]
+chimera = "chimera.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+warn_unused_ignores = true
+no_implicit_optional = true
