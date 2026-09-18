@@ -1,0 +1,50 @@
+# Version-update policy, in the tree instead of in the repo UI.
+#
+# Caveat worth knowing before you merge one of these: Dependabot's pip
+# ecosystem reads `pyproject.toml`, not `requirements.lock` (it only picks up
+# `*.txt` / `*.in` requirement files). A pip PR therefore bumps the pin and
+# leaves the lock stale — regenerate it in the same PR before merging:
+#
+#   uv pip compile pyproject.toml --extra dev --generate-hashes \
+#     --python-version 3.11 -o requirements.lock
+#
+# CI's `pip check` step is the backstop: a lock that no longer satisfies the
+# declared pins fails there rather than silently drifting.
+version: 2
+
+updates:
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "python"]
+    commit-message:
+      prefix: "chore(deps)"
+      include: "scope"
+    groups:
+      # One PR for the routine noise; majors still arrive on their own so they
+      # get read.
+      python-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/Los_Angeles"
+    open-pull-requests-limit: 5
+    labels: ["dependencies", "github-actions"]
+    commit-message:
+      prefix: "chore(ci)"
+      include: "scope"
+    groups:
+      actions-minor-and-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]

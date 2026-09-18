@@ -63,12 +63,14 @@ def _fast_producer_plan() -> GraphPlan:
         goal="g",
         rationale="r",
         phases=[
-            {"name": "make", "nodes": [
-                {"id": "m", "role": "researcher", "tier": "fast", "brief": "x"}
-            ]},
-            {"name": "check", "nodes": [
-                {"id": "c", "role": "critic", "brief": "x", "reads": ["m"]}
-            ]},
+            {
+                "name": "make",
+                "nodes": [{"id": "m", "role": "researcher", "tier": "fast", "brief": "x"}],
+            },
+            {
+                "name": "check",
+                "nodes": [{"id": "c", "role": "critic", "brief": "x", "reads": ["m"]}],
+            },
         ],
     )
 
@@ -103,4 +105,21 @@ def test_forced_equal_override_raises_maker_checker_violation(monkeypatch):
     monkeypatch.setenv("CHIMERA_MAKER_MODEL", "opus")
     monkeypatch.setenv("CHIMERA_CRITIC_MODEL", "opus")
     with pytest.raises(lite.MakerCheckerViolation):
-        lite.assert_maker_neq_checker()
+        lite.assert_panel_models_differ()
+
+
+def test_verdict_fires_the_wide_guard_on_a_research_tier_collision(monkeypatch):
+    """The narrower, critic-only check (`assert_maker_neq_checker`, deleted
+    2026-09-16) missed the executing angle's research-tier collision — it
+    compared the critic tier alone. `verdict()` now calls the wide guard,
+    `assert_panel_models_differ`, so a research-tier collision is caught at
+    decide time too, not only when `critic_calls()` happens to run first."""
+    from chimera.models import CriticOpinion
+
+    monkeypatch.setenv("CHIMERA_MAKER_MODEL", "opus")
+    monkeypatch.setenv("CHIMERA_RESEARCH_MODEL", "opus")
+    monkeypatch.setenv("CHIMERA_CRITIC_MODEL", "sonnet")
+    opinion = CriticOpinion(refuted=False, reason="x", severity=None)
+    with pytest.raises(lite.MakerCheckerViolation) as exc:
+        lite.verdict("lite", [opinion, opinion])
+    assert "research" in str(exc.value)

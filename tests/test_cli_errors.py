@@ -12,8 +12,8 @@ import json
 import pytest
 
 from chimera.cli import main
-from tests.test_failed_state import _new_task, run
 from tests.arc_drivers import _gr_plan_payload as plan_payload
+from tests.test_failed_state import _new_task, run
 
 
 def fail(capsys, *argv):

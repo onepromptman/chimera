@@ -1,43 +1,78 @@
-# --- Python -----------------------------------------------------------------
+# Runtime locks
+.chimera-tick.lock
+.claude/scheduled_tasks.lock
+
+# Memory + telemetry
+.claude/memory.db
+.claude/memory.db.bak
+.claude/memory.db.migrated
+.claude/telemetry/
+.claude/agent-memory/
+
+# Sessions, plans, settings.local
+.claude/settings.local.json
+.claude/worktrees/
+# Checkpoints live in wip/checkpoints/ (wip/ is ignored below); this pattern
+# stays as a safety net against stray root-level checkpoint files.
+.claude-checkpoint*.md
+
+# Local workspace zones (not part of the framework engine)
+projects/
+corporate-tasks/
+resume-mine-output/
+resume-mine-output.zip
+wip/
+/prompts/
+/data/
+.research/
+scratch/
+flows/*/output/
+# Personnel data — explicit belt-and-suspenders. Already covered by
+# flows/*/output/ above; this named rule keeps intern/HRIS data ignored even if
+# that glob is ever narrowed or refactored. Do not rely on a single pattern.
+# Stronger fix still open: relocate this data outside the repo tree entirely.
+**/intern-conversions/
+# Arc bakeoff working/output dir — chimera regenerates it when arcs run
+# (NOT a stray clone; see repo-sync reconcile 2026-06-27)
+/ai-group-training/
+
+# Per-machine overlay (not part of the framework; the package has no loader for it)
+/overlay/
+
+# Comms-arc personal voice packs (per-machine; loaded by voices.load_voice_overlay
+# if present). Framework ships none; a clean clone runs on generic voice guidance.
+# Personal / brand-specific voice content lives here and never enters a commit.
+/voice-packs/
+
+# Machine-local agent overrides.
+# A clean clone has nothing here; agents/install.py picks them up when present.
+/agents/catalogue/.local/
+
+# Personal prompt-forge reference pack (not wired into the framework engine;
+# kept machine-local, out of the tracked/public surface).
+/agents/forge/
+
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
+*.pyo
 *.egg-info/
-build/
-dist/
+.pytest_cache/
+.ruff_cache/
 .venv/
 venv/
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
 
-# --- Secrets ----------------------------------------------------------------
-# Never commit credentials. The package itself holds no tokens.
-.env
-.env.*
+# Secrets
+.env*
 !.env.example
 .mcp.json
-*.pem
-*.key
 
-# --- Runtime state ----------------------------------------------------------
-# The memory DB lives outside the repo by default ($CHIMERA_DB_PATH), but
-# ignore a local one so an in-repo override never gets committed.
-*.db
-*.sqlite
-*.sqlite3
+# OS
+.DS_Store
+Thumbs.db
 
-# Session telemetry written by the advisory router hook. Rotate it into
-# audits/ with scripts/rotate_router_audit.py, which strips it to metadata.
-.claude/telemetry/
-
-# Live task records and their artifacts.
-tasks/
-
-# --- Private working zones --------------------------------------------------
-# Anything under these paths stays local. Keep your own material here rather
-# than anywhere tracked; the protection is the path, so where you write
-# matters. See README "Keeping private content out of the repo".
-private/
-scratch/
-wip/
-flows/*/output/
+# Tool output
+build/
+dist/
+.coverage
+htmlcov/

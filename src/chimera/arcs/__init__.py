@@ -1,4 +1,4 @@
-"""The one launch arc: graph — the planner-emitted-DAG runtime.
+"""The one launch arc: graph — the planner-emitted-DAG runtime (ADR-010).
 
 The eight fixed pipelines (research/design/proposal/build/n8n/comms/reflect/
 gemini) were retired in the v7 consolidation: the planner composes their

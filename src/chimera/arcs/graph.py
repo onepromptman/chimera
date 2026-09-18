@@ -1,4 +1,4 @@
-"""Graph arc — the planner-emitted-DAG runtime (frontier rebuild).
+"""Graph arc — the planner-emitted-DAG runtime (frontier rebuild, ADR-009).
 
 The one arc whose shape is data: a planner node (read-only fence, frontier
 tier) emits a GraphPlan — phases of role-fenced nodes, reads restricted to
@@ -11,8 +11,8 @@ broke" is a read of committed state, not a tracing rig.
 Loops live in code, bounded, never in the plan:
   - admission refusal  -> ONE re-plan lap; the refusal text (which names the
     lever that would widen the posture) is fed back to the planner
-  - verify refutation  -> critique->rewrite laps via the shared
-    finalize_with_repair, bounded by the CHIMERA_GRAPH_REPAIR_LAPS lever
+  - verify refutation  -> critique->rewrite laps in _submit_verify,
+    bounded by the CHIMERA_GRAPH_REPAIR_LAPS lever
   - each node is an agent's own tool loop — the convergence plane the DAG
     deliberately does not model
 
@@ -23,47 +23,46 @@ Null tolerance: `node:` and `verify:` labels degrade (a lost gather is fewer
 candidates; the fan-in and the terminal panel judge what survived); `plan`
 and `wrap` are the two calls nothing can compensate for, so they halt.
 
-Mirrors the ReflectArc/ResearchArc duck-typed surface (start / initialize /
-load / save / pending_calls / submit / expire_timeouts / verify_verdict +
-state.phase) so cli.py and the parity suites dispatch over it unchanged.
+At a terminal PASS the run is compressed into an L2 abstract (run_abstract:
+ask, shape, the artifact's BLUF, what the panel refuted en route, degrade and
+repair tallies) and APPENDED as run-summary-<n>, so a retry cannot overwrite
+what the previous attempt learned. The write is fail-open — memory is a
+bonus, the verdict is the contract.
+
+The duck-typed arc surface (start / load / save / pending_calls / submit /
+expire_timeouts / verify_verdict + state.phase) is what cli.py and the parity
+suites dispatch over; a second arc ships by presenting the same one.
 """
 
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import Field
+from pydantic import Field, ValidationError
 
 from .. import arc_memory, graph, runner
 from ..agents import resolve_models
-from ..levers import GraphLevers, graph_levers
+from ..levers import GraphLevers, graph_levers, mutant_cadence
 from ..models import (
+    WRAP_BODY_MAX,
     AgentCall,
     AuditTrail,
+    CriticOpinion,
     GraphArtifact,
     GraphNodeOutput,
     GraphPlan,
     GraphShape,
-    TaskSpec,
+    MutantRun,
+    TaskRecord,
+    VerifyResult,
     _Strict,
 )
-from ..verify import lite, schema_gate
-from ._common import (
-    ARC_STATE_FILE,
-    PriorsSeed,
-    accumulate_verify_opinion,
-    arc_load,
-    arc_save,
-    dispatch_null,
-    expired_labels,
-    finalize_verify_with_repair,
-    load_task_record,
-    priors_block,
-    read_verify_result,
-    stamp_first_issued,
-)
+from ..verify import lite, mutants, schema_gate
+from ._common import ARC_STATE_FILE, PriorsSeed, priors_block
 
 # Work nodes get a longer leash than the 300s default: a maker or executor
 # slice can be a real build-and-test loop (mirrors build's passthrough shape,
@@ -74,11 +73,47 @@ from ._common import (
 # hair-triggered.
 CALL_CEILINGS: dict[str, int] = {"node": 1800, "plan": 1800, "wrap": 1800}
 
-# terminal verify panel payload cap — truncation past this is MARKED in the
-# prompt, never silent (audit OP-12); sized for frontier-tier critics
-VERIFY_PAYLOAD_MAX = 48_000
+# frontmatter + render overhead the panel window absorbs above the body
+# ceiling (first real run, 2026-09-04: a 52k body lost its Open findings to a
+# 48k cap and the lap was refuted for what the critics could not see)
+WRAP_BODY_HEADROOM = 2_000
+# terminal verify panel payload window: the wrap body ceiling
+# (models.WRAP_BODY_MAX — refused at the schema gate above it since
+# 2026-09-16, after disclosure alone was ignored by four wraps in a row) plus
+# the render overhead. Truncation past this is MARKED in the prompt, never
+# silent (audit OP-12); with the gate in front it is a fallback no gated
+# artifact can reach, and a test pins that a body AT the ceiling renders
+# inside the window.
+VERIFY_PAYLOAD_MAX = WRAP_BODY_MAX + WRAP_BODY_HEADROOM
 
 ARTIFACT_FILE = "graph-output.md"
+
+# Verify-stage finalize key set (label format per verify/lite.py). The trigger
+# is a KEY SET, not a count: a count cannot tell 2 valid opinions from 1 valid
+# + 1 key collision, and it does not survive the None a recoverable null slots.
+# Panel dropped 3 -> 2 critics 2026-09-16 (S1: ANGLE_ROLES = ("critic",
+# "executor")) — see graph.py's _VERIFY_PANEL for the evidence.
+VERIFY_KEYS = frozenset({"verify:critic1", "verify:critic2"})
+
+# The seeded-mutant control's label (C15). Deliberately NOT a member of
+# VERIFY_KEYS: the verdict's key set never grows, so the control can never
+# become a third opinion, a quorum member, or a veto. It is routed away from
+# `verify_opinions` at the first branch of `_submit_verify` and lands on
+# `state.mutant` instead. The finalize gate WAITS for it; the verdict never
+# changes because of it.
+MUTANT_KEY = f"verify:{lite.MUTANT_LABEL_SUFFIX}"
+
+# One file per control dispatch, beside verification.json (see
+# `_write_mutant_record`). The push-boundary tripwire
+# (tests/test_push_boundary.py) admits exactly `mutants/run-<n>.json`.
+MUTANT_RECORD_DIR = "mutants"
+
+# state.verify_opinions is reset on every repair lap, so the critique that
+# caused the lap is gone by the time the run summary is written. A bounded copy
+# lands on state.verify_notes — what a critic refuted is the single most useful
+# thing a later run can read (audit 2026-09-02, §5.2 proposal §1).
+VERIFY_NOTE_LIMIT = 5
+VERIFY_NOTE_CHARS = 300
 
 
 class GraphArcError(RuntimeError):
@@ -102,22 +137,27 @@ class GraphArcState(_Strict):
     stage: GraphStage = "plan"
     plan: GraphPlan | None = None
     plan_repairs: int = 0  # bounded re-plan laps taken (graph.MAX_PLAN_REPAIRS)
-    plan_brief: str | None = None  # admission refusal fed back into the next plan call
+    # the admission refusal + the refused plan's skeleton, fed back into the
+    # next plan call (plan_skeleton) so the re-plan can diff, not re-derive
+    plan_brief: str | None = None
     phase_index: int = 0
     outputs: dict[str, GraphNodeOutput | None] = Field(default_factory=dict)
     artifact: GraphArtifact | None = None
     verify_opinions: dict[str, object] = Field(default_factory=dict)
     verify_repairs: int = 0
     repair_brief: str | None = None
-    # executor→maker repair lap (approved 2026-08-28): an executor landing
-    # PAUSE re-runs the maker node(s) it read, then itself — sequentially via
-    # repair_queue, bounded per executor by CHIMERA_GRAPH_REPAIR_LAPS
+    # What the panel actually refuted, kept across the verify_opinions reset a
+    # repair lap performs, so the L2 run summary can carry the critique rather
+    # than a lap counter (record_verify_notes bounds it).
+    verify_notes: list[str] = Field(default_factory=list)
+    # exec_repairs / repair_queue / deferred_repairs / node_repair_briefs:
+    # retained for record compatibility; exec-repair machinery removed
+    # 2026-09-16 (tasks/20260916-optimize-dag/artifacts/graph-output.md — the
+    # edge appeared in 0 of 4 real plans). The arc no longer reads or writes
+    # these; they stay declared so a pre-existing committed arc-state.json
+    # still deserializes (state models are extra="forbid").
     exec_repairs: dict[str, int] = Field(default_factory=dict)
     repair_queue: list[str] = Field(default_factory=list)
-    # Sibling executors whose PAUSE arrived while a lap was in flight. They
-    # get their own lap when the queue drains — a PAUSE that never earns a
-    # repair because it lost a race is a repair lap that only works for the
-    # first executor in a phase.
     deferred_repairs: list[str] = Field(default_factory=list)
     node_repair_briefs: dict[str, str] = Field(default_factory=dict)
     failure: str | None = None
@@ -131,6 +171,10 @@ class GraphArcState(_Strict):
     # the transcript. Checkers derive from this record when it exists.
     node_models: dict[str, str] = Field(default_factory=dict)
     priors: PriorsSeed | None = None
+    # The seeded-mutant control for THIS run (C15), or None when the run is
+    # uncredentialed. Defaulted so every arc-state.json written before the
+    # control existed still loads (state models are extra="forbid").
+    mutant: MutantRun | None = None
 
     @property
     def phase(self) -> str:
@@ -142,6 +186,165 @@ class GraphArcState(_Strict):
             "done": "complete",
             "halted": "failed",
         }[self.stage]
+
+
+# ---------------------------------------------------------------------------
+# run_abstract — what a terminal run tells the NEXT run (L2 body)
+# ---------------------------------------------------------------------------
+
+ABSTRACT_ASK_CHARS = 200
+ABSTRACT_BLUF_CHARS = 400
+
+
+def first_paragraph(body: str, limit: int = ABSTRACT_BLUF_CHARS) -> str:
+    """The artifact's BLUF: its first non-heading, non-empty paragraph.
+
+    Wrap artifacts open with a "## BLUF" heading by convention, so the useful
+    sentence is the first block that is neither a heading nor a horizontal
+    rule. Returns "" when the body carries no such block.
+    """
+    for block in (body or "").split("\n\n"):
+        text = " ".join(block.split())
+        if not text or text.startswith("#") or set(text) <= {"-", "="}:
+            continue
+        return text[:limit]
+    return ""
+
+
+def _credential_line(state: GraphArcState) -> str:
+    """What this run's control measured, for the L2 abstract.
+
+    `mutant-caught (quantity, fatal)` or the honest `panel-uncredentialed`. A
+    later run reading "caught" learns the panel caught a SEEDED defect of that
+    class — never that the artifact was verified."""
+    credential = lite.credential(state.mutant)
+    if state.mutant is None or state.mutant.defect is None:
+        return credential
+    detail: list[str] = [state.mutant.defect.operator]
+    if state.mutant.graded_fatal:
+        detail.append("fatal")
+    return f"{credential} ({', '.join(detail)})"
+
+
+def run_abstract(state: GraphArcState) -> str:
+    """One arc run, compressed into what a later run can act on."""
+    plan = state.plan
+    shape = state.shape
+    if plan is not None:
+        shape_line = (
+            f"{shape or 'planner-proposed'} "
+            f"({len(plan.phases)} phases, "
+            f"{sum(len(ph.nodes) for ph in plan.phases)} nodes)"
+        )
+    else:
+        shape_line = f"{shape or 'planner-proposed'} (no plan recorded)"
+
+    lines = [
+        f"ASK: {' '.join(state.ask.split())[:ABSTRACT_ASK_CHARS]}",
+        f"SHAPE: {shape_line}",
+        f"CREDENTIAL: {_credential_line(state)}",
+    ]
+    bluf = first_paragraph(state.artifact.body) if state.artifact is not None else ""
+    lines.append(f"BLUF: {bluf}" if bluf else "BLUF: (no artifact body recorded)")
+    if state.verify_notes:
+        lines.append("REFUTED EN ROUTE:")
+        lines += [f"- {note}" for note in state.verify_notes]
+    degraded = sum(1 for v in state.outputs.values() if v is None)
+    lines.append(
+        f"RUN: outcome={state.phase} degraded_nodes={degraded} "
+        f"plan_repairs={state.plan_repairs} verify_repairs={state.verify_repairs}"
+    )
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Arc plumbing — lived in arcs/_common.py until 2026-09-03, one caller each
+# ---------------------------------------------------------------------------
+
+
+def expired_labels(
+    state: Any,
+    calls: Sequence[AgentCall],
+    *,
+    ceilings: Mapping[str, int] | None = None,
+    now: datetime | None = None,
+) -> list[str]:
+    """Stamped labels among *calls* older than their ceiling. The ceiling for a
+    label is ceilings.get(label.split(":", 1)[0], runner.PER_BRANCH_TIMEOUT_S)."""
+    ceilings = CALL_CEILINGS if ceilings is None else ceilings
+    now = now or datetime.now(UTC)
+    expired: list[str] = []
+    for call in calls:
+        stamp = state.first_issued.get(call.label)
+        if stamp is None:
+            continue
+        issued = datetime.strptime(stamp, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        ceiling = ceilings.get(call.label.split(":", 1)[0], runner.PER_BRANCH_TIMEOUT_S)
+        if (now - issued).total_seconds() > ceiling:
+            expired.append(call.label)
+    return expired
+
+
+def record_verify_notes(state: Any, opinions: Sequence[Any]) -> None:
+    """Append this lap's refuting reasons to state.verify_notes, bounded."""
+    notes = getattr(state, "verify_notes", None)
+    if notes is None:
+        return
+    for opinion in opinions:
+        if len(notes) >= VERIFY_NOTE_LIMIT:
+            return
+        if opinion is None or not getattr(opinion, "refuted", False):
+            continue
+        reason = " ".join(str(getattr(opinion, "reason", "") or "").split())
+        severity = getattr(opinion, "severity", None) or "unrated"
+        notes.append(f"[{severity}] {reason[:VERIFY_NOTE_CHARS]}")
+
+
+def repair_brief(opinions: Sequence[Any], attempt: int) -> str:
+    """Turn the refuting verify opinions into a rewrite brief for the wrap
+    maker. Instead of discarding the critique when verify fails, feed it back
+    so the next wrap resolves it (Gohel loop pattern #1)."""
+    refuting = [o for o in opinions if o is not None and getattr(o, "refuted", False)]
+    if refuting:
+        bullets = "\n".join(f"- [{o.severity}] {o.reason}" for o in refuting)
+    else:
+        bullets = (
+            "- (panel refused to substantiate the artifact; strengthen sourcing "
+            "and internal consistency)"
+        )
+    return (
+        f"PRIOR DRAFT (repair attempt {attempt}) WAS REFUTED by the verify panel. "
+        "Produce a corrected artifact that resolves every point below. Keep all "
+        "inputs verbatim — do not re-grade or invent evidence:\n"
+        f"{bullets}"
+    )
+
+
+def plan_skeleton(plan: GraphPlan) -> str:
+    """The shape a refused plan actually had — one line per phase, node ids
+    and roles. Fed back with the refusal so the re-plan lap can DIFF against
+    what it emitted instead of re-deriving it blind (the planner call it costs
+    is the most expensive call in the run)."""
+    return "\n".join(
+        f"- phase {i + 1} {phase.name!r}: "
+        + ", ".join(f"{node.id}({node.role})" for node in phase.nodes)
+        for i, phase in enumerate(plan.phases)
+    )
+
+
+def load_task_record(task_dir: Path) -> TaskRecord | None:
+    """Read tasks/<id>/task.json into a TaskRecord, or None if absent/corrupt.
+
+    Fail-open on exactly (ValidationError, OSError) — a real bug elsewhere is
+    not swallowed. Returns None rather than raising so start() can surface its
+    own arc-specific error."""
+    record_path = task_dir / "task.json"
+    if not record_path.exists():
+        return None
+    try:
+        return TaskRecord.model_validate_json(record_path.read_text())
+    except (ValidationError, OSError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +367,7 @@ def _plan_prompt(
     plan_brief: str = "",
     priors: str = "",
     shape: str | None = None,
+    mutant_due: bool = False,
 ) -> str:
     context_section = f"\nCONTEXT:\n{context}\n" if context else ""
     shape_section = (
@@ -182,71 +386,32 @@ def _plan_prompt(
         else ""
     )
     priors_section = f"\n{priors}\n" if priors else ""
-    budget_overhead = graph.overhead_calls(levers.repair_laps)
-    return f"""You are chimera's graph planner (slug={slug}). Decompose the ask into
-a phase-structured graph of role-fenced nodes and return it as a GraphPlan.
+    overhead = graph.overhead_calls(levers.repair_laps, 1 if mutant_due else 0)
+    # disclosed, never hidden: the planner is told the machinery it plans
+    # alongside, and on a credentialed run that machinery is one call larger
+    mutant_section = " + one seeded-mutant control call" if mutant_due else ""
+    return f"""Plan one graph run (slug={slug}). Decompose THE ASK into a
+phase-structured graph of role-fenced nodes.
 
 THE ASK:
 {ask}
 {context_section}{shape_section}{repair_section}{priors_section}
-THE CONTRACT — the DAG is data, the loop is code:
-- phases run in order with a barrier between them; nodes WITHIN a phase run in
-  parallel, each in a fresh context
-- a node's `reads` may name node ids from STRICTLY earlier phases only — that
-  is what its prompt will contain; plan the information flow explicitly
-- a bounded revision is a shape, not a cycle: make -> check -> revise is three
-  phases; unbounded convergence (the verify repair lap) is the engine's job,
-  not the plan's
-
-ROLES (the fence is the capability — pick the weakest role that can do the slice):
-- researcher: read + web, no write. Gathers and cites; every claim anchored.
-- maker: writes artifacts, no shell, no network.
-- executor: shell (tests/checks), no write.
-- critic: read-only + web. Asks ONE question of an artifact, once.
-- judge: read-only. Scores candidates / merges verdicts; declares a winner.
-(planner is you; do not plan further planner nodes.)
-
-TIER DIAL per node: "frontier" (deep synthesis, judgment, authorship) or
-"fast" (breadth-first gathering, routine transforms). Checker nodes ignore
-the dial — their model derives distinct from the maker they read.
-
-SHAPE LIBRARY (compose freely within the posture; these cover most work):
-- pipeline: single nodes in sequence — deterministic transforms
-- diamond: N parallel lenses -> one fan-in judge/synthesis node
-- map: same brief over K disjoint slices -> a merge node that reads all K
-- generate-verify: maker -> critic(s) -> (optional) revise maker
-
-RULES ADMISSION WILL ENFORCE (plan within them, they are not suggestions):
+THE POSTURE ADMISSION WILL ENFORCE ON THIS RUN (plan within it, it is not a
+suggestion):
 - at most {levers.width_max} nodes per phase, {levers.phases_max} phases
-- 2+ same-role researcher/maker nodes in one phase MUST all be read by one
-  later node (parallel candidates need a fan-in, or disagreements land
-  unexamined)
-- every critic/judge node must read at least one node, and may not read
-  producers of mixed tiers (maker≠checker must stay derivable)
-- whole-run call budget {levers.call_budget}: your nodes + {budget_overhead} calls of fixed
-  machinery (plan, wrap, verify panel, repair allowance). Plan the SMALLEST
-  graph that covers the ask — single-node phases are fine, 2-3 phases is the
-  normal case, breadth only where independent perspectives genuinely raise
-  quality.
+- fixed machinery of {overhead} calls beyond your nodes (plan, wrap, 2-critic
+  verify panel, one repair allowance{mutant_section})
 
-Return JSON matching GraphPlan: {{"goal": str (restate the ask), "rationale":
-str (why this shape, one paragraph), "phases": [{{"name": slug, "nodes":
-[{{"id": slug, "role": str, "brief": str, "tier": "frontier"|"fast",
-"reads": [node-id]}}]}}]}}"""
+Return JSON matching GraphPlan."""
 
 
-def _wrap_prompt(
-    slug: str, plan: GraphPlan, digest: str, repair_brief: str = ""
-) -> str:
+def _wrap_prompt(slug: str, plan: GraphPlan, digest: str, repair_brief: str = "") -> str:
     repair_section = f"{repair_brief}\n\n" if repair_brief else ""
     n_phases = len(plan.phases)
     n_nodes = sum(len(p.nodes) for p in plan.phases)
-    return f"""You are chimera's graph wrap maker (slug={slug}). Consolidate the node
-outputs below into the final GraphArtifact. You merge, you never author: every
-claim must trace to a node output (keep its anchors). Where a checker node
-flagged a failure, resolve it from the surviving evidence or state it plainly
-as an open finding — never paper over it. Degraded nodes are marked; do not
-invent their content.
+    body_ceiling = WRAP_BODY_MAX
+    return f"""Consolidate the node outputs below into this run's final
+GraphArtifact (slug={slug}).
 
 {repair_section}TASK GOAL:
 {plan.goal}
@@ -254,50 +419,17 @@ invent their content.
 NODE OUTPUTS (phase order):
 {digest}
 
-Produce:
-- frontmatter (GraphFrontmatter): slug: {slug}; created: ISO-8601 UTC (current
-  time, YYYY-MM-DDTHH:MM:SSZ); phases: {n_phases}; nodes: {n_nodes};
-  status: "complete" (or "partial" if a degraded node left a real gap).
-- body: markdown. BLUF first (the one-sentence answer to the goal), then the
-  consolidated result, then an "open findings" section for anything a checker
-  flagged that remains unresolved.
+FRONTMATTER VALUES FOR THIS RUN: slug: {slug}; phases: {n_phases}; nodes:
+{n_nodes}; created: the current time as ISO-8601 UTC (YYYY-MM-DDTHH:MM:SSZ);
+status: "complete", or "partial" if a degraded node left a real gap.
 
-Return JSON matching GraphArtifact: {{"frontmatter": {{...}}, "body": str}}"""
+BODY CEILING: a body over {body_ceiling:,} characters is REFUSED at submit (the
+schema gate names the overage and you are re-run once); the verify panel reads
+at most {VERIFY_PAYLOAD_MAX:,} characters of the rendered artifact. Keep the
+body under {body_ceiling:,} characters — cut restatement, never evidence or
+open findings.
 
-
-def _phase_ordered(state: GraphArcState, ids: set[str]) -> list[str]:
-    """*ids* in plan order — earlier phases first, so a repair lap re-runs
-    producers before the nodes that read them."""
-    assert state.plan is not None
-    return [
-        n.id for ph in state.plan.phases for n in ph.nodes if n.id in ids
-    ]
-
-
-def _downstream_landed(state: GraphArcState, seeds: set[str]) -> list[str]:
-    """Already-landed nodes that read *seeds* transitively, in phase order.
-
-    Reads reference strictly earlier phases, so the read graph is a DAG and
-    this closure terminates. Seeds themselves are excluded — the caller
-    handles those; this is the blast radius around them."""
-    assert state.plan is not None
-    index = {n.id: n for ph in state.plan.phases for n in ph.nodes}
-    order = [n.id for ph in state.plan.phases for n in ph.nodes]
-    tainted = set(seeds)
-    changed = True
-    while changed:
-        changed = False
-        for nid in order:
-            if nid in tainted:
-                continue
-            if set(index[nid].reads) & tainted:
-                tainted.add(nid)
-                changed = True
-    return [
-        nid
-        for nid in order
-        if nid in tainted and nid not in seeds and nid in state.outputs
-    ]
+Return JSON matching GraphArtifact."""
 
 
 # ---------------------------------------------------------------------------
@@ -317,10 +449,16 @@ class GraphArc:
     # ----- state load/save -------------------------------------------------
 
     def save(self, state: GraphArcState | None = None) -> Path:
-        return arc_save(self.state_path, state, GraphArcError)
+        if state is None:
+            raise GraphArcError("save requires a state")
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        self.state_path.write_text(state.model_dump_json(indent=2))
+        return self.state_path
 
     def load(self) -> GraphArcState:
-        state = arc_load(self.state_path, GraphArcState, GraphArcError)
+        if not self.state_path.exists():
+            raise GraphArcError(f"no arc state at {self.state_path} — run start first")
+        state = GraphArcState.model_validate_json(self.state_path.read_text())
         shape = self._authoritative_shape(state)
         if state.plan is not None:
             try:
@@ -360,28 +498,17 @@ class GraphArc:
 
     # ----- lifecycle -------------------------------------------------------
 
-    def start(
-        self, task_id: str, slug: str, ask: str, context: str | None
-    ) -> GraphArcState:
+    def start(self, task_id: str, slug: str, ask: str, context: str | None) -> GraphArcState:
         if self.state_path.exists():
             return self.load()
         return self._fresh_state(task_id, slug, ask, context)
 
-    def initialize(self, spec: TaskSpec) -> GraphArcState:
-        if self.state_path.exists():
-            return self.load()
-        return self._fresh_state(spec.id, spec.slug, spec.ask, spec.context)
-
-    def _fresh_state(
-        self, task_id: str, slug: str, ask: str, context: str | None
-    ) -> GraphArcState:
+    def _fresh_state(self, task_id: str, slug: str, ask: str, context: str | None) -> GraphArcState:
         # The operator's G1 shape pick rides the task record; read it fail-open
         # (a missing record means no pick — the planner proposes freely).
         record = load_task_record(self.task_dir)
         shape = record.spec.shape if record is not None else None
-        state = GraphArcState(
-            spec_id=task_id, slug=slug, ask=ask, context=context, shape=shape
-        )
+        state = GraphArcState(spec_id=task_id, slug=slug, ask=ask, context=context, shape=shape)
         state.priors = priors_block("graph", ask)
         state.log.append(f"graph-arc start slug={slug}")
         if state.priors.rows:
@@ -391,15 +518,19 @@ class GraphArc:
 
     def expire_timeouts(self, state: GraphArcState) -> list[str]:
         calls = self.pending_calls(state)
-        expired = expired_labels(state, calls, ceilings=CALL_CEILINGS)
+        expired = expired_labels(state, calls)
         for label in expired:
             state = self._handle_null(state, label, kind="timeout") or state
         if expired:
             self.save(state)
         return expired
 
-    def verify_verdict(self, state: GraphArcState):
-        return read_verify_result(self.task_dir, GraphArcError)
+    def verify_verdict(self, state: GraphArcState) -> VerifyResult:
+        """The terminal verdict, read back from verification.json."""
+        verification_path = self.task_dir / "verification.json"
+        if not verification_path.exists():
+            raise GraphArcError("verify_verdict called before verification.json was written")
+        return VerifyResult.model_validate_json(verification_path.read_text())
 
     # ----- pending calls ---------------------------------------------------
 
@@ -410,28 +541,23 @@ class GraphArc:
             calls = [self._plan_call(state)]
         elif state.stage == "run":
             assert state.plan is not None
-            if state.repair_queue:
-                # an exec-repair lap runs SEQUENTIALLY: maker(s) first, then
-                # the executor re-checks — one call pending at a time
-                calls = [self._repair_call(state, state.repair_queue[0])]
-            else:
-                calls = graph.phase_calls(
-                    state.plan,
-                    state.phase_index,
-                    ask=state.ask,
-                    outputs=state.outputs,
-                    # the L2 priors seed reaches the WORK nodes, not just the
-                    # planner (audit roadmap #10 — the param was dead before)
-                    priors=state.priors.block if state.priors else "",
-                    dispatched=state.node_models,
-                )
+            calls = graph.phase_calls(
+                state.plan,
+                state.phase_index,
+                ask=state.ask,
+                outputs=state.outputs,
+                dispatched=state.node_models,
+            )
         elif state.stage == "wrap":
             calls = [self._wrap_call(state)]
         elif state.stage == "verify":
             calls = self._verify_calls(state)
         else:
             calls = []  # done or halted
-        stamp_first_issued(state, calls)
+        # First-issue stamp per pending label, keep-earliest: the expiry clock
+        # starts once, not on every re-list. Persisted by the caller (cli.py).
+        for call in calls:
+            state.first_issued.setdefault(call.label, call.issued_at)
         # Record the dispatched model for every node call. Persisted by the
         # same caller save that persists the first-issued stamps (cli.py).
         # First write wins: a node re-issued after a lever change keeps the
@@ -454,6 +580,7 @@ class GraphArc:
                 plan_brief=state.plan_brief or "",
                 priors=priors_text,
                 shape=state.shape,
+                mutant_due=self._mutant_due(),
             ),
             schema_name="GraphPlan",
             # the planner rides the JUDGE tier (default = maker alias): the
@@ -463,22 +590,6 @@ class GraphArc:
             subagent_type=subagent,
             selection_reason=reason,
         )
-
-    def _repair_call(self, state: GraphArcState, node_id: str) -> AgentCall:
-        assert state.plan is not None
-        for phase in state.plan.phases:
-            for node in phase.nodes:
-                if node.id == node_id:
-                    return graph.node_call(
-                        state.plan,
-                        phase.name,
-                        node,
-                        ask=state.ask,
-                        outputs=state.outputs,
-                        repair_note=state.node_repair_briefs.get(node_id, ""),
-                        dispatched=state.node_models,
-                    )
-        raise GraphArcError(f"repair queue references unknown node {node_id!r}")
 
     def _wrap_call(self, state: GraphArcState) -> AgentCall:
         assert state.plan is not None
@@ -513,27 +624,45 @@ class GraphArc:
         # pending means pending: a critic whose opinion (or null) already
         # landed is not re-issued (the v6 stage arcs re-listed the whole
         # panel; a driving session pumping calls one at a time then spun).
-        return [c for c in calls if c.label not in state.verify_opinions]
+        pending = [c for c in calls if c.label not in state.verify_opinions]
+        pending += self._mutant_calls(state, body)
+        return pending
+
+    def _mutant_calls(self, state: GraphArcState, body: str) -> list[AgentCall]:
+        """The seeded-mutant control, if this run has one still outstanding.
+
+        The payload is the SAME body the panel reads (truncation marker and
+        all), with one recorded defect re-applied to it — so the only thing
+        that differs between this call and the angle it rides is the artifact
+        itself. A control that cannot be built degrades to `not-measured`
+        rather than wedging the finalize gate behind a call nobody can issue
+        (the degrade is persisted by the same caller save that persists the
+        first-issue stamps; if the panel had already completed, the ordinary
+        `arc submit <id> verify:mutant1 --null` re-triggers finalize).
+        """
+        run = state.mutant
+        if run is None or run.status != "pending" or run.defect is None:
+            return []
+        try:
+            payload = mutants.apply(run.defect, body)
+        except Exception as exc:
+            state.mutant = run.model_copy(
+                update={"status": "not-measured", "note": f"apply failed: {type(exc).__name__}"}
+            )
+            state.log.append(f"MUTANT_NOT_MEASURED apply failed: {type(exc).__name__}")
+            return []
+        return [lite.mutant_call("verify", payload, run.defect.angle, phase="verify")]
 
     # ----- submit ----------------------------------------------------------
 
     def submit(
         self,
-        state=None,
-        label=None,
-        payload=None,
+        state: GraphArcState,
+        label: str,
+        payload: object | None = None,
         kind: str = "null",
     ) -> GraphArcState:
-        """Accept one agent submission. Dual-form, matching the other arcs."""
-        if isinstance(state, str):
-            actual_payload = label
-            label = state
-            state = self.load()
-            payload = actual_payload
-        if state is None:
-            state = self.load()
-        assert label is not None, "submit requires a label"
-
+        """Accept one agent submission. *payload* None = a degraded call."""
         if payload is None:
             return self._handle_null(state, label, kind)
 
@@ -562,39 +691,53 @@ class GraphArc:
             return self._submit_verify(state, label, payload_json)
         raise GraphArcError(f"unknown submit label: {label}")
 
-    def _route_null(self, state: GraphArcState, label: str) -> GraphArcState:
-        """dispatch_null's recoverable router: a null verify critic slots as
-        None (proportional majority tolerates it); a null work node slots as
-        None (the fan-in and the terminal panel judge what survived)."""
+    def _handle_null(self, state: GraphArcState, label: str, kind: str) -> GraphArcState:
+        """Route one degraded submission (null | timeout | threw).
+
+        `node:` and `verify:` degrade: a null critic slots as None (the
+        thin-panel check below `<2 valid` fails the run rather than treating a
+        missing opinion as anything else) and a null work node slots as None
+        (the fan-in and the terminal panel judge what survived). `plan` and
+        `wrap` are the two calls nothing can compensate for, so they halt.
+
+        Counter semantics follow runner.py: record_null does NOT touch
+        agent_calls_attempted, so the attempted increment happens here —
+        through issue_call, so the 250-call ceiling binds on the null path too
+        (audit OP-4)."""
+        try:
+            runner.issue_call(state.audit, label)
+        except runner.CeilingExceeded as exc:
+            runner.record_null(state.audit, label, kind=kind)
+            state.stage = "halted"
+            state.failure = str(exc)
+            state.log.append(f"CEILING label={label}: run aborted at the call ceiling")
+            self.save(state)
+            return state
+        runner.record_null(state.audit, label, kind=kind)
+        state.log.append(f"NULL_AGENT label={label} kind={kind}")
+        state.first_issued.pop(label, None)
         if label.startswith("verify:"):
             return self._submit_verify(state, label, None)
-        return self._slot_node(state, label, None)
-
-    def _handle_null(self, state: GraphArcState, label: str, kind: str) -> GraphArcState:
-        return dispatch_null(
-            state,
-            label,
-            kind,
-            recoverable=("node:", "verify:"),
-            route=self._route_null,
-            save=self.save,
-        )
+        if label.startswith("node:"):
+            return self._slot_node(state, label, None)
+        state.stage = "halted"
+        state.failure = f"null submission at label {label!r} (primary maker)"
+        self.save(state)
+        return state
 
     # ----- plan ------------------------------------------------------------
 
     def _submit_plan(self, state: GraphArcState, payload_json: str) -> GraphArcState:
         if state.stage != "plan":
             raise GraphArcError(f"plan submission but arc is in stage {state.stage}")
-        plan = schema_gate.validate("GraphPlan", json.loads(payload_json))
+        plan = schema_gate.validate_as(GraphPlan, json.loads(payload_json))
         try:
             graph.admit(plan, graph_levers(), shape=state.shape)
         except graph.GraphAdmissionError as exc:
             if state.plan_repairs < graph.MAX_PLAN_REPAIRS:
                 state.plan_repairs += 1
-                state.plan_brief = str(exc)
-                state.log.append(
-                    f"PLAN_REFUSED attempt={state.plan_repairs}: {exc}"
-                )
+                state.plan_brief = f"{exc}\n\nTHE PLAN YOU EMITTED:\n{plan_skeleton(plan)}"
+                state.log.append(f"PLAN_REFUSED attempt={state.plan_repairs}: {exc}")
                 self.save(state)
                 return state
             state.stage = "halted"
@@ -604,9 +747,6 @@ class GraphArc:
             )
             self.save(state)
             return state
-        warning = graph.judge_tier_warning(plan)
-        if warning:
-            state.log.append(warning)
         state.plan = plan
         state.plan_brief = None  # consumed
         state.stage = "run"
@@ -614,7 +754,8 @@ class GraphArc:
         state.log.append(
             f"PLAN_ADMITTED phases={len(plan.phases)} "
             f"nodes={sum(len(p.nodes) for p in plan.phases)} "
-            f"estimated_calls={graph.estimated_calls(plan, graph_levers().repair_laps)}"
+            f"estimated_calls="
+            f"{graph.estimated_calls(plan, graph_levers().repair_laps, 1 if self._mutant_due() else 0)}"
         )
         self.save(state)
         return state
@@ -623,7 +764,7 @@ class GraphArc:
 
     def _submit_node(self, state: GraphArcState, label: str, payload_json: str) -> GraphArcState:
         node_id = label.split(":", 1)[1]
-        out = schema_gate.validate("GraphNodeOutput", json.loads(payload_json))
+        out = schema_gate.validate_as(GraphNodeOutput, json.loads(payload_json))
         if out.node_id != node_id:
             raise GraphArcError(
                 f"node payload declares node_id {out.node_id!r} but was submitted "
@@ -635,50 +776,25 @@ class GraphArc:
         self, state: GraphArcState, label: str, out: GraphNodeOutput | None
     ) -> GraphArcState:
         if state.stage != "run":
-            raise GraphArcError(
-                f"node submission {label!r} but arc is in stage {state.stage}"
-            )
+            raise GraphArcError(f"node submission {label!r} but arc is in stage {state.stage}")
         assert state.plan is not None
         node_id = label.split(":", 1)[1]
-        # A repair-lap head bypasses the current-phase check: the maker being
-        # repaired lives in an EARLIER phase (reads reference strictly earlier
-        # phases), and its id was removed from outputs when the lap queued.
-        repairing = bool(state.repair_queue) and node_id == state.repair_queue[0]
-        if not repairing:
-            if node_id in state.repair_queue:
-                raise GraphArcError(
-                    f"node {node_id!r} is queued for repair but not at the "
-                    f"head — a lap runs in order; submit "
-                    f"{state.repair_queue[0]!r} first"
-                )
-            current = state.plan.phases[state.phase_index]
-            current_ids = {n.id for n in current.nodes}
-            if node_id not in current_ids:
-                known = node_id in {n.id for p in state.plan.phases for n in p.nodes}
-                raise GraphArcError(
-                    f"node {node_id!r} is not in the current phase "
-                    f"{current.name!r}"
-                    + (" (submitted out of phase order)" if known else " (unknown node id)")
-                )
-            if node_id in state.outputs:
-                raise GraphArcError(f"node {node_id!r} already submitted")
+        current = state.plan.phases[state.phase_index]
+        current_ids = {n.id for n in current.nodes}
+        if node_id not in current_ids:
+            known = node_id in {n.id for p in state.plan.phases for n in p.nodes}
+            raise GraphArcError(
+                f"node {node_id!r} is not in the current phase "
+                f"{current.name!r}"
+                + (" (submitted out of phase order)" if known else " (unknown node id)")
+            )
+        if node_id in state.outputs:
+            raise GraphArcError(f"node {node_id!r} already submitted")
         state.outputs[node_id] = out
-        if repairing:
-            state.repair_queue.pop(0)
-            state.node_repair_briefs.pop(node_id, None)
+        if out is None:
             state.log.append(
-                f"NODE_REPAIRED {node_id}"
-                if out is not None
-                else f"NODE_REPAIR_DEGRADED {node_id}"
+                f"NODE_DEGRADED {node_id} phase={state.plan.phases[state.phase_index].name}"
             )
-            if not state.repair_queue:
-                self._drain_deferred_repair(state)
-        elif out is None:
-            state.log.append(
-                f"NODE_DEGRADED {node_id} "
-                f"phase={state.plan.phases[state.phase_index].name}"
-            )
-        self._maybe_trigger_exec_repair(state, node_id, out)
         # Barrier: advance only when every node of the current phase landed.
         while state.phase_index < len(state.plan.phases) and all(
             n.id in state.outputs for n in state.plan.phases[state.phase_index].nodes
@@ -689,138 +805,241 @@ class GraphArc:
         self.save(state)
         return state
 
-    def _drain_deferred_repair(self, state: GraphArcState) -> None:
-        """The lap just drained — give the next deferred sibling PAUSE its own
-        lap. A deferred node that is no longer landed was invalidated by the
-        lap that just ran and will re-trigger on its own when it re-lands, so
-        it is dropped here rather than double-queued."""
-        while state.deferred_repairs:
-            candidate = state.deferred_repairs.pop(0)
-            out = state.outputs.get(candidate)
-            if out is None or not out.recommendation.startswith("PAUSE"):
-                continue
-            self._maybe_trigger_exec_repair(state, candidate, out)
-            if state.repair_queue:
-                return
-
-    def _maybe_trigger_exec_repair(
-        self, state: GraphArcState, node_id: str, out: GraphNodeOutput | None
-    ) -> None:
-        """The executor→maker repair lap (approved 2026-08-28): make → check →
-        revise embedded as a bounded loop in CODE, never as phases. An
-        executor landing PAUSE re-runs the maker node(s) it read (carrying
-        the executor's findings), then itself — up to
-        CHIMERA_GRAPH_REPAIR_LAPS laps per executor. On exhaustion the PAUSE
-        stands and rides the digest: flags never block (80/20)."""
-        if out is None or not out.recommendation.startswith("PAUSE"):
-            return
-        assert state.plan is not None
-        index = {n.id: n for p in state.plan.phases for n in p.nodes}
-        node = index.get(node_id)
-        if node is None or node.role != "executor":
-            return  # a non-executor PAUSE has no repair edge; it rides the digest
-        maker_reads = [r for r in node.reads if index[r].role == "maker"]
-        if not maker_reads:
-            return  # nothing upstream to repair
-        if state.repair_queue:
-            # A lap is already in flight for a sibling executor. This PAUSE is
-            # neither silently forgotten NOR permanently skipped: it is
-            # DEFERRED and gets its own lap when the queue drains (audit R-3
-            # made this a log line; a log is not a repair). Note the common
-            # case never reaches here — a sibling reading the SAME maker is
-            # invalidated by that maker's repair below and re-runs in the lap.
-            if node_id not in state.deferred_repairs:
-                state.deferred_repairs.append(node_id)
-            state.log.append(
-                f"EXEC_REPAIR_DEFERRED {node_id}: a lap is already in flight "
-                f"(head {state.repair_queue[0]!r}) — queued for its own lap"
-            )
-            return
-        laps = state.exec_repairs.get(node_id, 0)
-        if laps >= graph_levers().repair_laps:
-            state.log.append(
-                f"EXEC_REPAIR_EXHAUSTED {node_id} laps={laps} — PAUSE stands, rides the digest"
-            )
-            return
-        state.exec_repairs[node_id] = laps + 1
-        findings = out.output
-
-        # Everything downstream of a repaired maker is now stale. A sibling
-        # that already landed PROCEED did so against maker content that no
-        # longer exists — leaving its verdict in `outputs` ships an approval
-        # of a deleted artifact. Invalidate the transitive closure and re-run
-        # it in the same lap, in phase order (makers first, readers after).
-        stale = _downstream_landed(state, set(maker_reads))
-        for maker_id in maker_reads:
-            state.outputs.pop(maker_id, None)
-            state.node_models.pop(maker_id, None)
-            state.node_repair_briefs[maker_id] = (
-                f"Executor node '{node_id}' ran this work and reported failures "
-                f"(repair lap {laps + 1}):\n{findings}"
-            )
-        for stale_id in stale:
-            state.outputs.pop(stale_id, None)
-            state.node_models.pop(stale_id, None)
-            if stale_id == node_id:
-                state.node_repair_briefs[stale_id] = (
-                    f"Re-run your checks against the repaired upstream work "
-                    f"(repair lap {laps + 1})."
-                )
-            else:
-                state.node_repair_briefs[stale_id] = (
-                    f"Upstream node(s) {', '.join(maker_reads)} were repaired "
-                    f"after executor '{node_id}' reported failures (repair lap "
-                    f"{laps + 1}). Your previous result judged content that no "
-                    "longer exists — re-run against the repaired work."
-                )
-        state.repair_queue = _phase_ordered(state, set(maker_reads) | set(stale))
-        state.log.append(
-            f"EXEC_REPAIR node={node_id} lap={laps + 1} "
-            f"makers={','.join(maker_reads)} "
-            f"invalidated={','.join(i for i in stale if i != node_id) or 'none'}"
-        )
-
     # ----- wrap + verify ----------------------------------------------------
 
     def _submit_wrap(self, state: GraphArcState, payload_json: str) -> GraphArcState:
         if state.stage != "wrap":
             raise GraphArcError(f"wrap submission but arc is in stage {state.stage}")
-        artifact = schema_gate.validate("GraphArtifact", json.loads(payload_json))
+        artifact = schema_gate.validate_as(GraphArtifact, json.loads(payload_json))
         state.artifact = artifact
+        rendered = self._render_artifact(artifact)
         artifacts_dir = self.task_dir / "artifacts"
         artifacts_dir.mkdir(parents=True, exist_ok=True)
-        (artifacts_dir / ARTIFACT_FILE).write_text(
-            self._render_artifact(artifact), encoding="utf-8"
-        )
+        (artifacts_dir / ARTIFACT_FILE).write_text(rendered, encoding="utf-8")
         state.repair_brief = None  # consumed; re-set only on re-refutation
         state.stage = "verify"
+        # Schedule the seeded-mutant control ONCE per run, here — the moment
+        # the artifact the panel will read exists. Both guards matter: a run
+        # that already has a control keeps it, and `verify_repairs == 0` means
+        # a repair lap re-wraps without ever re-dispatching one.
+        if state.mutant is None and state.verify_repairs == 0:
+            self._schedule_mutant(state, rendered)
         self.save(state)
         return state
+
+    # ----- the seeded-mutant control (C15) ---------------------------------
+
+    def _mutant_due(self) -> bool:
+        """Is the NEXT verdict a credentialed one?
+
+        Derived from the committed verdict population (`mutants.due`), so the
+        cadence survives a restart without a counter file of its own.
+        Fail-open: an unreadable queue reports "no" and the run proceeds
+        uncredentialed."""
+        try:
+            return mutants.due(self.task_dir.parent, mutant_cadence())
+        except Exception:
+            return False
+
+    def _schedule_mutant(self, state: GraphArcState, rendered: str) -> None:
+        """Seed one defect into a COPY of the artifact, or record why not.
+
+        Never raises and never blocks: not due -> no control at all (the
+        verdict reads `panel-uncredentialed`); due but nothing seedable, or a
+        defect past the panel's payload window -> `not-measured`. The seeding
+        is pure Python (verify/mutants.py), so the maker never authors its own
+        credential."""
+        try:
+            if not self._mutant_due():
+                return
+            defect = mutants.seed(rendered, self.task_dir.parent.parent)
+        except Exception as exc:  # a control must never break the run it measures
+            self._not_measured(state, f"seed failed: {type(exc).__name__}")
+            return
+        if defect is None:
+            self._not_measured(state, mutants.NO_OPERATOR_NOTE)
+        elif not mutants.within_payload(defect, VERIFY_PAYLOAD_MAX):
+            self._not_measured(state, mutants.PAST_WINDOW_NOTE)
+        else:
+            state.mutant = MutantRun(status="pending", defect=defect, label=MUTANT_KEY)
+            state.log.append(
+                f"MUTANT_SEEDED operator={defect.operator} angle={defect.angle} "
+                f"class={defect.defect_class}"
+            )
+
+    def _not_measured(self, state: GraphArcState, note: str) -> None:
+        base = state.mutant or MutantRun(label=MUTANT_KEY)
+        state.mutant = base.model_copy(
+            update={"status": "not-measured", "note": note[:500], "opinion": None}
+        )
+        state.log.append(f"MUTANT_NOT_MEASURED {note[:120]}")
+
+    def _record_mutant(self, state: GraphArcState, payload_json: str | None) -> None:
+        """Grade the control — and NEVER raise.
+
+        `caught` means the angle refuted the seeded variant; `missed` means it
+        did not. Both are facts about the PANEL, recorded beside the verdict
+        and changing nothing about it (verify/lite.credential). Every failure
+        path — a null, a timeout, a payload that does not validate, a control
+        that was never scheduled — is `not-measured`, because an unanswerable
+        control is not evidence in either direction.
+        """
+        run = state.mutant
+        if run is None or run.status != "pending":
+            # nothing is outstanding: a stray or duplicate submit cannot mint a
+            # credential. No control scheduled stays `panel-uncredentialed`; a
+            # control already graded keeps what it measured.
+            state.log.append(f"MUTANT_IGNORED no pending control for {MUTANT_KEY}")
+            return
+        base = run
+        try:
+            if payload_json is None:
+                raise ValueError("null or timed-out control call")
+            opinion = schema_gate.validate_as(CriticOpinion, json.loads(payload_json))
+        except Exception as exc:
+            self._not_measured(state, f"{type(exc).__name__}: {exc}")
+        else:
+            caught = opinion.refuted
+            state.mutant = base.model_copy(
+                update={
+                    "status": "caught" if caught else "missed",
+                    "opinion": opinion,
+                    "graded_fatal": opinion.severity == "fatal",
+                    "note": None,
+                }
+            )
+            operator = base.defect.operator if base.defect else "unknown"
+            state.log.append(
+                f"MUTANT_{'CAUGHT' if caught else 'MISSED'} operator={operator} "
+                f"severity={opinion.severity or 'unrated'}"
+            )
+        self._write_mutant_record(state)
+
+    def _write_mutant_record(self, state: GraphArcState) -> None:
+        """Persist one control dispatch to tasks/<id>/mutants/run-<n>.json.
+
+        n = 1 + the records already there (the `append_run_summary`
+        convention), so a retry never clobbers what a previous attempt
+        measured. Written through the same door verification.json uses, so the
+        CLI's existing per-task checkpoint commits it with no cli.py change.
+        Fail-open: an unwritable record is a lost datum, never a lost run.
+        """
+        if state.mutant is None:
+            return
+        try:
+            records = self.task_dir / MUTANT_RECORD_DIR
+            records.mkdir(parents=True, exist_ok=True)
+            attempt = 1 + len(list(records.glob("run-*.json")))
+            (records / f"run-{attempt}.json").write_text(
+                state.mutant.model_dump_json(indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            state.log.append(f"MUTANT_RECORD_DEGRADED: {type(exc).__name__}")
 
     def _submit_verify(
         self, state: GraphArcState, label: str, payload_json: str | None
     ) -> GraphArcState:
-        return accumulate_verify_opinion(
-            state,
-            label,
-            payload_json,
-            error_cls=GraphArcError,
-            finalize=self.finalize_verify,
-            save=self.save,
-            load=self.load,
-        )
+        """The whole verify tail, in one function (it was four, one caller
+        each, until 2026-09-03).
 
-    def finalize_verify(self, opinions: list) -> GraphArcState:
-        return finalize_verify_with_repair(
-            self.task_dir,
-            self.load,
-            opinions,
-            error_cls=GraphArcError,
-            arc_name="graph",
-            save=self.save,
-            on_pass=self._summarize_to_memory,
-            max_repairs=graph_levers().repair_laps,
-        )
+        Slots one critic opinion — or None, for a recoverable null — through
+        the schema gate and saves. Until both VERIFY_KEYS are present that is
+        the entire story. Once the panel is complete it re-reads the
+        freshest PERSISTED state (the 2026-07-02 fatal-revert fix: never
+        finalize a stale in-memory object), computes the lite verdict and
+        finalizes one of three ways:
+
+          - passed -> stage 'done', the fail-open L2 run summary,
+            verification.json;
+          - genuinely refuted (>=2 valid critics) with repair budget left ->
+            the critique becomes state.repair_brief, the panel resets and the
+            arc rewinds to wrap: ONE bounded critique -> rewrite lap (Gohel
+            patterns #1/#2), no verification.json yet — it is not terminal;
+          - thin panel (<2 valid, nothing a rewrite can fix) or budget
+            exhausted -> stage 'halted' + verification.json.
+        """
+        if state.stage != "verify":
+            raise GraphArcError(f"verify submission '{label}' but arc is in stage {state.stage}")
+        if label == MUTANT_KEY:
+            # routed away from the verdict at the FIRST branch: the control's
+            # opinion never reaches verify_opinions, so it can never become a
+            # third opinion, an open finding, or a veto
+            self._record_mutant(state, payload_json)
+        elif payload_json is None:
+            state.verify_opinions[label] = None
+        else:
+            opinion = schema_gate.validate_as(CriticOpinion, json.loads(payload_json))
+            state.verify_opinions[label] = opinion.model_dump()
+        state.first_issued.pop(label, None)
+        self.save(state)
+        if not VERIFY_KEYS.issubset(state.verify_opinions):
+            return state
+        if state.mutant is not None and state.mutant.status == "pending":
+            # the control has not landed; the verdict WAITS for it, and does
+            # not change because of it. Writing a verdict now would carry a
+            # credential field that misstates what was measured.
+            return state
+
+        opinions: list[CriticOpinion | None] = []
+        for i in (1, 2):
+            raw = state.verify_opinions.get(f"verify:critic{i}")
+            opinions.append(CriticOpinion.model_validate(raw) if raw else None)
+
+        state = self.load()
+        if state.stage != "verify":
+            raise GraphArcError(f"finalize_verify in wrong stage: {state.stage}")
+        # the credential rides the verdict; `passed` is still computed from the
+        # two real critics alone (verify/lite.verdict)
+        result = lite.verdict("lite", opinions, mutant=state.mutant)
+        verification_path = self.task_dir / "verification.json"
+
+        if result.passed:
+            state.stage = "done"
+            # a PASS can still carry a non-fatal refutation (fatal-only veto)
+            # — record it the same way the repair branch does, or the L2
+            # abstract's "REFUTED EN ROUTE" block is empty even though the
+            # panel refuted something.
+            if any(o is not None and o.refuted for o in opinions):
+                record_verify_notes(state, opinions)
+            try:
+                # the L2 run summary is a bonus, the verdict is the contract:
+                # a locked or corrupt DB must never strand a PASS mid-finalize
+                # (audit 2026-09-02, P2-12)
+                self._summarize_to_memory(state)
+            except Exception as exc:
+                state.log.append(f"MEMORY_WRITE_DEGRADED on_pass: {type(exc).__name__}")
+            verification_path.write_text(result.model_dump_json(indent=2))
+            self.save(state)
+            return state
+
+        genuine = result.valid_critic_count >= 2
+        if genuine and state.verify_repairs < graph_levers().repair_laps:
+            record_verify_notes(state, opinions)
+            state.verify_repairs += 1
+            state.repair_brief = repair_brief(opinions, state.verify_repairs)
+            state.verify_opinions = {}  # fresh panel for the next lap
+            state.stage = "wrap"
+            state.log.append(
+                f"VERIFY_REPAIR attempt={state.verify_repairs} "
+                f"({result.unrefuted_count}/{result.valid_critic_count} unrefuted) -> re-wrap"
+            )
+            self.save(state)
+            return state
+
+        state.stage = "halted"
+        if not genuine:
+            state.failure = (
+                f"graph arc halted: lite verify failed — thin panel "
+                f"({result.valid_critic_count} valid critic(s), cannot repair)"
+            )
+        else:
+            state.failure = (
+                f"graph arc halted: lite verify failed after {state.verify_repairs} "
+                f"repair(s) ({result.unrefuted_count}/{result.valid_critic_count} unrefuted)"
+            )
+        verification_path.write_text(result.model_dump_json(indent=2))
+        self.save(state)
+        return state
 
     # ----- rendering + memory ---------------------------------------------
 
@@ -842,20 +1061,17 @@ class GraphArc:
         return "\n".join(lines)
 
     def _summarize_to_memory(self, state: GraphArcState) -> None:
-        plan = state.plan
-        shape = (
-            f"phases={len(plan.phases)} nodes={sum(len(p.nodes) for p in plan.phases)}"
-            if plan is not None
-            else "no plan recorded"
-        )
-        degraded = sum(1 for v in state.outputs.values() if v is None)
-        summary = (
-            f"phase={state.phase} {shape} degraded_nodes={degraded} "
-            f"plan_repairs={state.plan_repairs} verify_repairs={state.verify_repairs}"
-        )
-        arc_memory.summarize_run(
+        """Write the PASS run summary to layer 2 as an ABSTRACT, not counters.
+
+        Counters ("phases=2 nodes=3 degraded_nodes=0") are telemetry: a later
+        run reading them learns nothing it can act on (audit 2026-09-02, §5.2).
+        Everything here already exists in state — the ask, the wrap BLUF, the
+        shape, what the critics refuted on the way through, and the degrade /
+        repair tallies as a one-line footer.
+        """
+        arc_memory.append_run_summary(
             arc_kind="graph",
             arc_id=state.spec_id,
-            summary=summary,
+            summary=run_abstract(state),
             tags="terminal",
         )

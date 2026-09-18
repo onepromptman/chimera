@@ -21,6 +21,12 @@ Storage shape:
     body      = the learning text
     tags      = optional free-text tag string (FTS-searchable)
 
+Terminal run summaries go through ``append_run_summary`` (title
+``run-summary-<n>``): the dedup key means a FIXED title turns a second
+attempt on the same arc_id into an UPDATE, which erased what the first
+attempt learned (audit 2026-09-02, P1-6). The fixed-title convenience that
+did exactly that was deleted 2026-09-03; nothing but its own test called it.
+
 This module must NOT call into git, subprocess, or runner.checkpoint() so
 that arcs can import it freely (see tests/test_no_write_outside_wrapper.py).
 It lives at src/chimera/arc_memory.py, NOT under src/chimera/arcs/, so the
@@ -165,7 +171,7 @@ def arc_search(
                 SELECT m.*, bm25(memories_fts) AS score
                 FROM memories_fts
                 JOIN memories m ON m.id = memories_fts.rowid
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY score
                 LIMIT ?
             """
@@ -181,7 +187,7 @@ def arc_search(
                 params.append(arc_id)
             sql = f"""
                 SELECT * FROM memories
-                WHERE {' AND '.join(clauses)}
+                WHERE {" AND ".join(clauses)}
                 ORDER BY updated_at DESC
                 LIMIT ?
             """
@@ -192,7 +198,24 @@ def arc_search(
     return [_row_to_dict(r) for r in rows]
 
 
-def summarize_run(
+RUN_SUMMARY_PREFIX = "run-summary"
+
+
+def run_summary_count(*, arc_kind: str, arc_id: str, db_path: Path | None = None) -> int:
+    """How many ``run-summary*`` rows already exist for this (kind, id)."""
+    _validate_kind_id(arc_kind, arc_id)
+    target = Path(db_path) if db_path is not None else DEFAULT_DB_PATH
+    with _connect(target) as conn:
+        _ensure_schema(conn)
+        row = conn.execute(
+            """SELECT COUNT(*) AS n FROM memories
+               WHERE arc_kind = ? AND arc_id = ? AND title LIKE ?""",
+            (arc_kind, arc_id, f"{RUN_SUMMARY_PREFIX}%"),
+        ).fetchone()
+    return int(row["n"]) if row is not None else 0
+
+
+def append_run_summary(
     *,
     arc_kind: str,
     arc_id: str,
@@ -200,16 +223,20 @@ def summarize_run(
     tags: str | None = None,
     db_path: Path | None = None,
 ) -> dict:
-    """Convenience for the common case: one end-of-run summary per arc.
+    """Append one attempt's end-of-run summary — never clobber a prior one.
 
-    Uses the fixed title ``"run-summary"`` so re-running the same arc_id
-    overwrites instead of appending. For multi-summary cases (e.g. one per
-    phase), call ``arc_write`` directly with phase-suffixed titles.
+    The title is ``run-summary-<n>`` where n is 1 + the number of existing
+    ``run-summary*`` rows for this (arc_kind, arc_id), so a PASS and a later
+    FAIL (or a ``chimera retry`` re-run) on the same task id each keep their
+    own row. The dedup key of ``arc_write`` still holds inside one attempt:
+    a second call in the SAME attempt is a new row only because the count
+    moved, which is what "attempt" means here.
     """
+    attempt = run_summary_count(arc_kind=arc_kind, arc_id=arc_id, db_path=db_path) + 1
     return arc_write(
         arc_kind=arc_kind,
         arc_id=arc_id,
-        title="run-summary",
+        title=f"{RUN_SUMMARY_PREFIX}-{attempt}",
         body=summary,
         tags=tags,
         db_path=db_path,

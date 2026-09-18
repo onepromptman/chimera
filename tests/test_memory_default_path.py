@@ -15,7 +15,6 @@ from __future__ import annotations
 
 import importlib
 import sqlite3
-from pathlib import Path
 
 import pytest
 
@@ -33,7 +32,7 @@ def _reload_memory(monkeypatch, home, env_path=None):
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
     monkeypatch.setenv("HOMEDRIVE", home.drive or "")
-    monkeypatch.setenv("HOMEPATH", str(home)[len(home.drive):] if home.drive else str(home))
+    monkeypatch.setenv("HOMEPATH", str(home)[len(home.drive) :] if home.drive else str(home))
     if env_path is not None:
         monkeypatch.setenv("CHIMERA_DB_PATH", str(env_path))
     else:

@@ -18,7 +18,7 @@ import re
 import socket
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import digest as digest_mod
@@ -26,13 +26,15 @@ from . import gitio, notify, runner
 from .arcs._common import ARC_STATE_FILE
 from .arcs.graph import GraphArc, GraphArcError
 from .gates import (
-    g1_answer,
+    OperatorGateError,
     g1_intake,
     g2_approve,
+    g2_enforcement,
     g2_reject,
-    read_questions,
+    init_operator_token,
+    operator_digest_path,
+    verify_operator,
 )
-from .models import VerifyResult
 from .queue import Queue, QueueError, next_runnable, retired_ready, tick_lock
 from .verify.schema_gate import SchemaGateError
 
@@ -114,7 +116,7 @@ def _die(
 
 
 def _arc_for(queue: Queue, task_id: str):
-    """Return the arc instance for a task. One live arc since the v7 consolidation; a
+    """Return the arc instance for a task. One live arc since ADR-010; a
     retired arc's record still loads (status/history/archive) but cannot be
     dispatched — retry it as a fresh graph task instead."""
     record = queue.load(task_id)
@@ -125,8 +127,8 @@ def _arc_for(queue: Queue, task_id: str):
     if record.spec.arc in RETIRED_ARCS:
         raise QueueError(
             f"{task_id}: arc {record.spec.arc!r} was retired in the v7 "
-            "consolidation. The record remains readable; to redo the "
-            "work, open it as a graph task: chimera new \"<ask>\""
+            "consolidation (ADR-010). The record remains readable; to redo the "
+            'work, open it as a graph task: chimera new "<ask>"'
         )
     raise QueueError(f"unknown arc {record.spec.arc!r} (no dispatch mapping)")
 
@@ -135,11 +137,12 @@ def _checkpoint_task(queue: Queue, task_id: str, message: str) -> None:
     runner.checkpoint(queue.root, [queue.task_dir(task_id)], f"chimera({task_id}): {message}")
 
 
-def _push_and_emit_state(queue: Queue, record) -> None:
-    """Shared tail for the simple lifecycle commands (answer/approve/reject/
-    archive): push, then emit the {ok, task_id, state} triple."""
+def _push_and_emit_state(queue: Queue, record, **extra: object) -> None:
+    """Shared tail for the simple lifecycle commands (approve/reject/
+    archive): push, then emit the {ok, task_id, state} triple (plus any
+    command-specific keys, e.g. archive's memory_captured)."""
     gitio.push(queue.root)
-    _emit({"ok": True, "task_id": record.spec.id, "state": record.state})
+    _emit({"ok": True, "task_id": record.spec.id, "state": record.state, **extra})
 
 
 def _write_failed_l2(record, failure: str | None) -> None:
@@ -150,12 +153,12 @@ def _write_failed_l2(record, failure: str | None) -> None:
     try:
         from . import arc_memory
 
-        arc_memory.summarize_run(
+        arc_memory.append_run_summary(
             arc_kind=record.spec.arc,
             arc_id=record.spec.id,
             summary=(
+                f"ASK: {' '.join(record.spec.ask.split())[:200]}\n"
                 f"arc FAILED: {failure or 'no failure reason recorded'}"
-                f" | ask: {record.spec.ask}"
             ),
             tags="terminal,failed",
         )
@@ -180,31 +183,14 @@ def cmd_new(args: argparse.Namespace) -> None:
     records = g1_intake(
         queue,
         ask=args.ask,
-        outcome=args.outcome,
         by=_worker(),
-        questions=args.question or None,
         context=args.context,
         slug=args.slug,
         shape=args.shape,
     )
     gitio.push(queue.root)
-    out = []
-    for r in records:
-        entry = {"task_id": r.spec.id, "state": r.state}
-        if r.state == "awaiting-input":
-            qs = read_questions(queue, r.spec.id)
-            entry["questions_comment"] = notify.questions_comment(qs)
-            entry["issue_title"] = notify.issue_title(r)
-            entry["issue_body"] = notify.issue_body(r)
-        out.append(entry)
+    out = [{"task_id": r.spec.id, "state": r.state} for r in records]
     _emit({"ok": True, "tasks": out})
-
-
-def cmd_answer(args: argparse.Namespace) -> None:
-    queue = Queue()
-    answers = {k: v for k, v in (args.answer or [])}
-    record = g1_answer(queue, args.task_id, answers, by=_worker())
-    _push_and_emit_state(queue, record)
 
 
 def cmd_tick(args: argparse.Namespace) -> None:
@@ -219,11 +205,11 @@ def cmd_tick(args: argparse.Namespace) -> None:
         for candidate in queue.list_tasks("running"):
             if candidate.spec.arc != "graph":
                 # a pre-consolidation running record can't dispatch; park it
-                # failed so it never starves the loop (F7)
+                # failed so it never starves the loop (F7, applied to ADR-010)
                 _fail_task(
                     queue,
                     candidate,
-                    f"arc {candidate.spec.arc!r} retired",
+                    f"arc {candidate.spec.arc!r} retired (ADR-010)",
                     by=_worker(),
                     note="retired arc detected at tick",
                 )
@@ -275,9 +261,12 @@ def cmd_tick(args: argparse.Namespace) -> None:
                         "note": "no runnable tasks",
                         **({"failed_tasks": newly_failed} if newly_failed else {}),
                         **(
-                            {"retired_ready": stranded,
-                             "retired_note": "these ready tasks have retired arcs; archive them or re-open the ask as a graph task"}
-                            if stranded else {}
+                            {
+                                "retired_ready": stranded,
+                                "retired_note": "these ready tasks have retired arcs (ADR-010) and no queue-level exit; the operator clears one with `git rm -r tasks/<id>` + commit, then re-opens the ask as a graph task if it still matters",
+                            }
+                            if stranded
+                            else {}
                         ),
                     }
                 )
@@ -300,10 +289,15 @@ def cmd_tick(args: argparse.Namespace) -> None:
                     # — reload; saving this reference could revert a terminal state
                     state = arc.load()
                     _checkpoint_task(queue, record.spec.id, f"expired timeouts: {expired}")
-            # pending_calls() stamps first-issue times (N1) — compute once, save so
-            # the stamps survive the process, then reuse the same list in the emit.
+            # pending_calls() stamps first-issue times (N1) — compute once, save,
+            # and COMMIT so the stamps survive the container, not just the
+            # process (run 20260904-tick-stamp-durability: only submit had the
+            # commit half; a reclaimed container re-issued with a fresh clock).
+            # gitio.commit is a no-op when nothing changed, so a quiet resume
+            # tick adds no commit.
             calls = arc.pending_calls(state)
             arc.save(state)
+            _checkpoint_task(queue, record.spec.id, f"issued {len(calls)} call(s)")
         except (gitio.GitError, QueueError):
             raise  # infra failures are transient/operator-level, not the task's
         except Exception as exc:
@@ -362,9 +356,11 @@ def _arc_next_locked(queue: Queue, args: argparse.Namespace) -> None:
         # revert a timeout-finalized terminal state
         state = arc.load()
         _checkpoint_task(queue, args.task_id, f"expired timeouts: {expired}")
-    # pending_calls() stamps first-issue times (N1) — save before emitting.
+    # pending_calls() stamps first-issue times (N1) — save AND commit before
+    # emitting (same durability contract as cmd_tick; no-op when unchanged).
     calls = arc.pending_calls(state)
     arc.save(state)
+    _checkpoint_task(queue, args.task_id, f"issued {len(calls)} call(s)")
     _emit(
         {
             "ok": True,
@@ -423,6 +419,14 @@ def _arc_submit_locked(queue: Queue, args: argparse.Namespace) -> None:
         record = queue.transition(
             args.task_id, "awaiting-signoff", by=_worker(), note="arc complete"
         )
+        # G2 is review-after: a passing panel is the approval, so the task
+        # finishes without parking on the operator (`reject` reopens it). A
+        # failing panel still parks at awaiting-signoff — that needs a human.
+        if verdict.passed:
+            queue.record_approval(args.task_id, by="auto:verify-pass")
+            record = queue.transition(
+                args.task_id, "done", by=_worker(), note="verification passed"
+            )
         digest_path = digest_mod.write(queue)
         # this checkpoint's push carries the verification + transition commits
         # too — but checkpoint only pushes when its own commit is non-empty, and
@@ -452,15 +456,54 @@ def _arc_submit_locked(queue: Queue, args: argparse.Namespace) -> None:
 
 
 def cmd_approve(args: argparse.Namespace) -> None:
+    # G2 verbs commit through the same git index a running tick uses; take the
+    # writer lock in wait mode so an operator's approve queues behind a tick
+    # instead of losing its commit to index contention (run
+    # 20260904-tick-stamp-durability, defect B). Never the loud non-wait mode:
+    # a human gate verb must not die because the dispatcher happened to fire.
     queue = Queue()
-    record = g2_approve(queue, args.task_id, by=args.by)
-    _push_and_emit_state(queue, record)
+    with tick_lock(queue.root, wait=True):
+        record = g2_approve(queue, args.task_id, by=args.by, token=args.token)
+        _push_and_emit_state(queue, record)
 
 
 def cmd_reject(args: argparse.Namespace) -> None:
     queue = Queue()
-    record = g2_reject(queue, args.task_id, by=args.by, note=args.note)
-    _push_and_emit_state(queue, record)
+    with tick_lock(queue.root, wait=True):
+        record = g2_reject(queue, args.task_id, by=args.by, note=args.note, token=args.token)
+        _push_and_emit_state(queue, record)
+
+
+def cmd_g2_token(args: argparse.Namespace) -> None:
+    """`chimera g2-token init|check` — the operator-side half of the G2 gate."""
+    queue = Queue()
+    if args.g2_cmd == "init":
+        summary = init_operator_token(
+            queue.root,
+            rotate=bool(args.rotate),
+            token_path=Path(args.token_path) if args.token_path else None,
+        )
+        gitio.commit(
+            queue.root,
+            [operator_digest_path(queue.root)],
+            "chimera: G2 operator digest " + ("rotated" if args.rotate else "initialized"),
+        )
+        gitio.push(queue.root)
+        _emit(
+            {
+                "ok": True,
+                **summary,
+                "note": (
+                    f"token written to {summary['token_path']} (0600), outside the "
+                    "repo — init refuses a path inside it; only its digest is "
+                    "committed, and G2 reads that committed digest, not the "
+                    "working tree"
+                ),
+            }
+        )
+        return
+    mode = verify_operator(queue.root, args.token)
+    _emit({"ok": True, "g2_enforcement": mode, "token_accepted": mode == "token"})
 
 
 def cmd_abandon(args: argparse.Namespace) -> None:
@@ -525,16 +568,31 @@ def cmd_retry(args: argparse.Namespace) -> None:
 def cmd_archive(args: argparse.Namespace) -> None:
     queue = Queue()
     record = queue.load(args.task_id)
-    _capture_memory(queue, record)
-    record = queue.transition(args.task_id, "archived", by=_worker(), note="memory captured")
-    _push_and_emit_state(queue, record)
+    captured = _capture_memory(queue, record)
+    note = "memory captured" if captured else "archived (memory capture degraded)"
+    record = queue.transition(args.task_id, "archived", by=_worker(), note=note)
+    _push_and_emit_state(queue, record, memory_captured=captured)
 
 
-def _capture_memory(queue: Queue, record) -> None:
+def _capture_memory(queue: Queue, record) -> bool:
     """Memory capture on archive: one pattern row per task (dedup by title).
 
     Writes to memory.DEFAULT_DB_PATH — the same file the search shim reads
-    (F10 part 1: reads and writes were split across two DB files before)."""
+    (F10 part 1: reads and writes were split across two DB files before).
+
+    STRICTLY fail-open (audit 2026-09-02, P2-12): archive is a terminal
+    transition, so an unwritable/locked/corrupt DB degrades the capture, never
+    the transition. The degrade is reported on the archive payload as
+    `memory_captured: false`.
+    """
+    try:
+        _capture_memory_row(queue, record)
+    except Exception:
+        return False
+    return True
+
+
+def _capture_memory_row(queue: Queue, record) -> None:
     from . import memory
 
     db_path = memory.DEFAULT_DB_PATH
@@ -561,23 +619,6 @@ def _capture_memory(queue: Queue, record) -> None:
         conn.commit()
 
 
-def cmd_migrate_tasks(args: argparse.Namespace) -> None:
-    """One-shot task-record migration: strip spec fields removed from the
-    schema (e.g. `tournament`, removed 2026-07-02) from tasks/*/task.json.
-    Legacy records fail load() with a pointer here; there is deliberately no
-    silent compat shim."""
-    queue = Queue()
-    migrated = queue.migrate_task_records()
-    if migrated:
-        gitio.commit(
-            queue.root,
-            [queue.tasks_dir],
-            f"chimera: migrate {len(migrated)} task record(s) to current schema",
-        )
-        gitio.push(queue.root)
-    _emit({"ok": True, "migrated": migrated})
-
-
 def _pending_call_age(queue: Queue, task_id: str) -> dict | None:
     """Oldest pending-call label + age in seconds, fail-open (any exception ->
     None, omitted by the caller). Reads arc-state.json as plain JSON so a
@@ -594,19 +635,14 @@ def _pending_call_age(queue: Queue, task_id: str) -> dict | None:
         if not stamps:
             return None
         oldest_label = min(stamps, key=lambda label: stamps[label])
-        issued = datetime.strptime(stamps[oldest_label], "%Y-%m-%dT%H:%M:%SZ").replace(
-            tzinfo=timezone.utc
-        )
-        age_s = int((datetime.now(timezone.utc) - issued).total_seconds())
+        issued = datetime.strptime(stamps[oldest_label], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=UTC)
+        age_s = int((datetime.now(UTC) - issued).total_seconds())
         return {"oldest_label": oldest_label, "oldest_age_s": age_s}
     except Exception:
         return None
 
 
 def cmd_init(args: argparse.Namespace) -> None:
-    """First-run setup / preflight. The only command safe to run before
-    anything is configured, so it resolves the repo root itself rather than
-    assuming a working queue."""
     from .memory import PROJECT_ROOT
     from .setup_wizard import init as run_init
 
@@ -624,7 +660,7 @@ def cmd_status(args: argparse.Namespace) -> None:
     queue = Queue()
     tasks = []
     for r in queue.list_tasks():
-        entry = {
+        entry: dict[str, object] = {
             "id": r.spec.id,
             "state": r.state,
             "arc": r.spec.arc,
@@ -642,6 +678,8 @@ def cmd_status(args: argparse.Namespace) -> None:
             # M6 rider: push health up front — a lost push race or a dead
             # remote must be visible within one status call
             "push": gitio.push_health(queue.root),
+            # audit 2026-09-02 Q6: 'none' means any session can approve
+            "g2_enforcement": g2_enforcement(queue.root),
             "tasks": tasks,
         }
     )
@@ -655,7 +693,7 @@ def cmd_digest(args: argparse.Namespace) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Role install — the six fenced roles are the whole roster
+# Role install — the six fenced roles are the whole roster (ADR-010)
 # ---------------------------------------------------------------------------
 
 
@@ -677,13 +715,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("new", help="G1 intake — open task(s) from one ask")
     p.add_argument("ask")
-    p.add_argument(
-        "--outcome",
-        default="proceed-top",
-        choices=["proceed-top", "ask", "parallel-ab"],
-        help="Socratic lens outcome (the session runs agents.socratic() first)",
-    )
-    p.add_argument("--question", action="append", help="repeatable; required with --outcome ask")
     p.add_argument("--context", default=None)
     p.add_argument("--slug", default=None)
     p.add_argument(
@@ -694,11 +725,6 @@ def build_parser() -> argparse.ArgumentParser:
         "omit to let the planner propose within the levers",
     )
     p.set_defaults(func=cmd_new)
-
-    p = sub.add_parser("answer", help="record G1 answers, unpark the task")
-    p.add_argument("task_id")
-    p.add_argument("--answer", nargs=2, action="append", metavar=("QID", "TEXT"))
-    p.set_defaults(func=cmd_answer)
 
     p = sub.add_parser("tick", help="claim/resume a runnable task; print pending agent calls")
     p.set_defaults(func=cmd_tick)
@@ -718,16 +744,35 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--kind", default="null", choices=["null", "timeout", "threw"])
     p.set_defaults(func=cmd_arc_submit)
 
-    p = sub.add_parser("approve", help="G2 sign-off -> done (verify gate enforced)")
+    p = sub.add_parser("approve", help="G2 sign-off -> done (verify gate + operator token)")
     p.add_argument("task_id")
     p.add_argument("--by", default="operator")
+    p.add_argument(
+        "--token",
+        default=None,
+        help="operator token (else $CHIMERA_OPERATOR_TOKEN / ~/.config/chimera/operator-token)",
+    )
     p.set_defaults(func=cmd_approve)
 
-    p = sub.add_parser("reject", help="G2 rework -> back to running")
+    p = sub.add_parser("reject", help="G2 rework -> back to running (operator token)")
     p.add_argument("task_id")
     p.add_argument("--by", default="operator")
     p.add_argument("--note", required=True)
+    p.add_argument("--token", default=None)
     p.set_defaults(func=cmd_reject)
+
+    g2 = sub.add_parser("g2-token", help="operator token for the G2 gate").add_subparsers(
+        dest="g2_cmd", required=True
+    )
+    p = g2.add_parser(
+        "init", help="generate the token (stored outside the repo) + commit its digest"
+    )
+    p.add_argument("--rotate", action="store_true", help="replace an existing digest")
+    p.add_argument("--token-path", default=None, help="override ~/.config/chimera/operator-token")
+    p.set_defaults(func=cmd_g2_token)
+    p = g2.add_parser("check", help="verify the token available to this session against the digest")
+    p.add_argument("--token", default=None)
+    p.set_defaults(func=cmd_g2_token)
 
     p = sub.add_parser("abandon", help="running -> failed (unjam a wedged/failed arc)")
     p.add_argument("task_id")
@@ -742,23 +787,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("task_id")
     p.set_defaults(func=cmd_archive)
 
-    sub.add_parser(
-        "migrate-tasks", help="one-shot: strip removed spec fields from tasks/*/task.json"
-    ).set_defaults(func=cmd_migrate_tasks)
-
     sub.add_parser("status", help="list tasks").set_defaults(func=cmd_status)
     sub.add_parser("digest", help="write + commit digest/YYYY-MM-DD.md").set_defaults(
         func=cmd_digest
     )
 
-    p = sub.add_parser("init", help="first-run setup: write .env + preflight checks")
-    p.add_argument("--check", action="store_true",
-                   help="run preflight checks only; writes nothing")
-    p.add_argument("--non-interactive", action="store_true",
-                   help="accept all defaults without prompting")
-    p.add_argument("--force", action="store_true",
-                   help="overwrite an existing .env instead of backing it up")
-    p.add_argument("--root", default=None, help="repo root (default: autodetect)")
+    p = sub.add_parser(
+        "init", help="first-run setup wizard (--check = preflight only, writes nothing)"
+    )
+    p.add_argument("--check", action="store_true", help="run preflight checks only; write nothing")
+    p.add_argument("--non-interactive", action="store_true", help="take every default, ask nothing")
+    p.add_argument("--force", action="store_true", help="overwrite an existing .env")
+    p.add_argument("--root", default=None, help="repo root (default: git discovery)")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser("install-agents", help="write the six role .md files → ~/.claude/agents/")
@@ -773,6 +813,12 @@ def main(argv: list[str] | None = None) -> None:
     args = build_parser().parse_args(argv)
     try:
         args.func(args)
+    except OperatorGateError as exc:
+        _die(
+            str(exc),
+            hint="G2 is the operator's gate: run approve/reject from the machine that holds the token",
+            state_note="task state unchanged; the approval was refused before any write",
+        )
     except QueueError as exc:
         _die(str(exc))
     except SchemaGateError as exc:

@@ -1,4 +1,4 @@
-"""Step wrapper — the runtime hardening policies.
+"""Step wrapper — the workflow.js v2.1 hardening policies, ported.
 
 Policies (same constants, same semantics as safeAgent + the v2.1 guards):
   - AGENT_CALL_CEILING = 250: hard cap on issued agent calls per task run

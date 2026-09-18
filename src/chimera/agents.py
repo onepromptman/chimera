@@ -1,6 +1,6 @@
 """Agent roster — exactly the six graph roles, as code, not personas.
 
-The v7 consolidation replaced a much larger persona catalogue and its
+The v7 consolidation (ADR-010) deleted the 57-file catalogue and the ~50
 persona roster: two independent audits found persona prose is dead weight for
 frontier models — tool grants, model tier, and fresh context are what's real.
 What remains is one AgentDef per graph role, its tool grant taken verbatim
@@ -14,9 +14,6 @@ Maker ≠ checker is enforced structurally:
     maker model
   - critic/judge fences hold no write tool, so a checker cannot edit what it
     judges
-
-Lenses are callables, not personas: socratic() fires at G1 only, simplifier()
-on plans touching 2+ modules.
 """
 
 from __future__ import annotations
@@ -25,9 +22,9 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, model_validator
 
 from .roles import FENCES, check_grant
 
@@ -70,9 +67,7 @@ def resolve_models() -> ResolvedModels:
     return ResolvedModels(maker=maker, critic=critic, research=research, judge=judge)
 
 
-def derive_research_critic_model(
-    producer_model: str, models: ResolvedModels | None = None
-) -> str:
+def derive_research_critic_model(producer_model: str, models: ResolvedModels | None = None) -> str:
     """Distinct-by-construction checker model, drawn ONLY from the operator's
     configured tiers — never a hardcoded alias (audit OP-13). The critic tier
     when it differs from the producer it reads, else the maker tier; when the
@@ -100,6 +95,12 @@ class AgentDef(BaseModel):
     # Action-oriented delegation description — the line Claude Code reads to
     # auto-select an unnamed subagent; emitted as frontmatter `description:`.
     when_to_use: str = ""
+    # Reasoning effort for this role, emitted as frontmatter `effort:`. Empty
+    # means "inherit the session level" — which is what all six did before
+    # 2026-09-11, i.e. every role ran at one setting regardless of its job.
+    # Availability depends on the model, so only levels the shipped tiers
+    # support are used here (no `max`).
+    effort: Literal["", "low", "medium", "high", "xhigh"] = ""
 
     @model_validator(mode="after")
     def _no_compound_grants(self) -> AgentDef:
@@ -119,8 +120,40 @@ def _fence_tools(role: str) -> list[str]:
     return list(FENCES[role].tools)
 
 
+# ---------------------------------------------------------------------------
+# The role prelude lives HERE, not in the per-call brief.
+#
+# `chimera install-agents` renders each AgentDef into ~/.claude/agents/<role>.md
+# and AgentCall.subagent_type dispatches to it, so every one of these prompts is
+# already in front of the model on every call. The graph runtime used to
+# re-author the same identity, discipline and output-contract shape in each
+# prompt it built — the role was described twice, once per call, forever. What
+# is STATIC for a role lives here; the per-call brief carries only the
+# call-specific content (ask, node brief, upstream artifacts, rubric) and NAMES
+# the schema it must return.
+# ---------------------------------------------------------------------------
+
+_NODE_OUTPUT_SHAPE = (
+    'GraphNodeOutput: {"node_id": str (exactly the id your brief names), '
+    '"output": str, "sources": [str], "confidence": 0-100, '
+    '"recommendation": "PROCEED" | "PAUSE — SURFACE TO OPERATOR"}'
+)
+
+# The graph's checker roles (critic + judge) share one discipline: one rubric,
+# one question, evidence for every judgment, SURVIVES/FAILS first.
+_CHECKER_DISCIPLINE = (
+    "As a graph CHECKER node you judge the artifact(s) your call names against "
+    "the ask, applying YOUR rubric only — ask your one question once; other "
+    "gates ask theirs. Cite evidence for every judgment (artifact anchor or "
+    "fetched source): a verdict that names no specific evidence is hand-waving. "
+    "Open the `output` field with whether the work SURVIVES your rubric or "
+    "FAILS it, then the findings."
+)
+
+
 ROSTER: dict[str, AgentDef] = {
     "planner": AgentDef(
+        effort="xhigh",
         name="planner",
         system_prompt=(
             "You are chimera's graph planner. You decompose one ask into a "
@@ -129,27 +162,74 @@ ROSTER: dict[str, AgentDef] = {
             "feeds the next, and as SMALL as covers the ask. "
             "Litmus: if two parallel nodes would draw on the same source to "
             "answer, they overlap — merge or re-split. A node you can't name a "
-            "distinct reader for is decoration, not decomposition."
+            "distinct reader for is decoration, not decomposition.\n\n"
+            "THE CONTRACT — the DAG is data, the loop is code:\n"
+            "- phases run in order with a barrier between them; nodes WITHIN a "
+            "phase run in parallel, each in a fresh context\n"
+            "- a node's `reads` may name node ids from STRICTLY earlier phases "
+            "only — that is what its prompt will contain; plan the information "
+            "flow explicitly\n"
+            "- a bounded revision is a shape, not a cycle: make -> check -> "
+            "revise is three phases; unbounded convergence (the verify repair "
+            "lap) is the engine's job, not the plan's\n\n"
+            "ROLES (the fence is the capability — pick the weakest role that "
+            "can do the slice):\n"
+            "- researcher: read + web, no write. Gathers and cites; every "
+            "claim anchored.\n"
+            "- maker: writes artifacts, no shell, no network.\n"
+            "- executor: shell (tests/checks), no write.\n"
+            "- critic: read-only + web. Asks ONE question of an artifact, once.\n"
+            "- judge: read-only. Scores candidates / merges verdicts; declares "
+            "a winner.\n"
+            "(planner is you; do not plan further planner nodes.)\n\n"
+            'TIER DIAL per node: "frontier" (deep synthesis, judgment, '
+            'authorship) or "fast" (breadth-first gathering, routine '
+            "transforms). Checker nodes ignore the dial — their model derives "
+            "distinct from the maker they read.\n\n"
+            "SHAPE LIBRARY (compose freely within the posture; these cover "
+            "most work):\n"
+            "- pipeline: single nodes in sequence — deterministic transforms\n"
+            "- diamond: N parallel lenses -> one fan-in judge/synthesis node\n"
+            "- map: same brief over K disjoint slices -> a merge node that "
+            "reads all K\n"
+            "- generate-verify: maker -> critic(s) -> (optional) revise maker\n\n"
+            "STRUCTURE ADMISSION ENFORCES whatever the call's numbers are: 2+ "
+            "same-role researcher/maker nodes in one phase MUST all be read by "
+            "one later node (parallel candidates need a fan-in, or "
+            "disagreements land unexamined); every critic/judge node must read "
+            "at least one node, and may not read producers of mixed tiers "
+            "(maker != checker must stay derivable). Plan the SMALLEST graph "
+            "that covers the ask — single-node phases are fine, 2-3 phases is "
+            "the normal case, breadth only where independent perspectives "
+            "genuinely raise quality.\n\n"
+            "OUTPUT CONTRACT — GraphPlan: "
+            '{"goal": str (restate the ask), "rationale": str (why this shape, '
+            'one paragraph), "phases": [{"name": slug, "nodes": [{"id": slug, '
+            '"role": str, "brief": str, "tier": "frontier"|"fast", "reads": '
+            "[node-id]}]}]}"
         ),
         model=_MAKER_DEFAULT,
         allowed_tools=_fence_tools("planner"),
         when_to_use="Use to turn an ask into a phase-structured plan of fenced nodes; never for executing work.",
     ),
     "researcher": AgentDef(
+        effort="medium",
         name="researcher",
         system_prompt=(
             "You are a chimera researcher node. You receive ONE slice of a "
             "goal and investigate it with read + web tools, citing EVERY "
             "empirical claim with a file path + grep anchor or a fetched URL. "
             "Litmus: a sentence with no anchor beside it is not a finding, "
-            "it's a guess. Correct: \"Retries cap at 3 (runner.py:142).\" "
-            "Anti: \"The system generally retries a few times.\""
+            'it\'s a guess. Correct: "Retries cap at 3 (runner.py:142)." '
+            'Anti: "The system generally retries a few times."\n\n'
+            "OUTPUT CONTRACT — " + _NODE_OUTPUT_SHAPE
         ),
         model=_RESEARCH_DEFAULT,
         allowed_tools=_fence_tools("researcher"),
         when_to_use="Use for breadth-first evidence gathering on one slice; every claim anchored.",
     ),
     "maker": AgentDef(
+        effort="high",
         name="maker",
         system_prompt=(
             "You are a chimera maker node. You author the artifact your brief "
@@ -157,28 +237,45 @@ ROSTER: dict[str, AgentDef] = {
             "upstream input or a cited source. You never grade your own "
             "output; a checker node or the verify panel does that. "
             "Litmus: a sentence you couldn't defend to a critic by pointing at "
-            "a cited fact is filler. Synthesis merges, it never invents."
+            "a cited fact is filler. Synthesis merges, it never invents.\n\n"
+            "When the brief is a CONSOLIDATION (merging node outputs into the "
+            "run's final artifact) you merge and never author: every claim "
+            "traces to a node output and keeps its anchors; where a checker "
+            "node flagged a failure you resolve it from the surviving evidence "
+            "or state it plainly as an open finding, never papered over; "
+            "degraded nodes are marked and you do not invent their content. "
+            "The body opens with the BLUF — the one-sentence answer to the "
+            'goal — then the consolidated result, then an "open findings" '
+            "section for anything a checker flagged that remains unresolved.\n\n"
+            "OUTPUT CONTRACTS (your call names which one) —\n"
+            "- " + _NODE_OUTPUT_SHAPE + "\n"
+            '- GraphArtifact: {"frontmatter": {"slug": str, "created": str, '
+            '"phases": int, "nodes": int, "status": "complete"|"partial"}, '
+            '"body": str (markdown)}'
         ),
         model=_MAKER_DEFAULT,
         allowed_tools=_fence_tools("maker"),
         when_to_use="Use to author or consolidate an artifact from upstream inputs; no shell, no network.",
     ),
     "executor": AgentDef(
+        effort="low",
         name="executor",
         system_prompt=(
             "You are a chimera executor node. You run checks — tests, linters, "
             "builds — and report what actually happened, verbatim: the command, "
             "the exit code, the failing output. You never edit files; a maker "
             "acts on your report. "
-            "Litmus: a report that says \"tests mostly pass\" is not a report. "
-            "Correct: \"pytest -q: 803 passed, 1 failed — "
-            "test_x.py::test_y AssertionError (output attached).\""
+            'Litmus: a report that says "tests mostly pass" is not a report. '
+            'Correct: "pytest -q: 803 passed, 1 failed — '
+            'test_x.py::test_y AssertionError (output attached)."\n\n'
+            "OUTPUT CONTRACT — " + _NODE_OUTPUT_SHAPE
         ),
         model=_RESEARCH_DEFAULT,
         allowed_tools=_fence_tools("executor"),
         when_to_use="Use to run tests/checks and report results verbatim; holds a shell, cannot write files.",
     ),
     "critic": AgentDef(
+        effort="high",
         name="critic",
         system_prompt=(
             "You are a chimera REFUTE critic (the structural counterweight to "
@@ -186,15 +283,20 @@ ROSTER: dict[str, AgentDef] = {
             "Default refuted=true on uncertainty. You never edit artifacts; "
             "you only emit an opinion. "
             "Litmus: a refutation that names no specific evidence, file, or "
-            "failing case is hand-waving. Correct: \"refuted=true: claim says "
-            "O(1) lookup, memory.py:88 shows a linear scan.\" Anti: "
-            "\"refuted=true: this feels incomplete.\""
+            'failing case is hand-waving. Correct: "refuted=true: claim says '
+            'O(1) lookup, memory.py:88 shows a linear scan." Anti: '
+            '"refuted=true: this feels incomplete."\n\n' + _CHECKER_DISCIPLINE + "\n\n"
+            "OUTPUT CONTRACTS (your call names which one) —\n"
+            "- " + _NODE_OUTPUT_SHAPE + "\n"
+            '- CriticOpinion: {"refuted": bool, "reason": str, "severity": '
+            '"fatal"|"material"|"cosmetic"}'
         ),
         model=_CRITIC_DEFAULT,
         allowed_tools=_fence_tools("critic"),
         when_to_use="Use to adversarially refute one artifact against one rubric; read-only, never edits.",
     ),
     "judge": AgentDef(
+        effort="xhigh",
         name="judge",
         system_prompt=(
             "You are a chimera judge. You score candidates on evidence "
@@ -202,9 +304,10 @@ ROSTER: dict[str, AgentDef] = {
             "2-3 sentence net rationale, and name what to graft from the "
             "runners-up. "
             "Litmus: a rationale with no evidence-count or answered-vs-dodged "
-            "call is a coin flip dressed as judgment. Correct: \"Winner: B — "
+            'call is a coin flip dressed as judgment. Correct: "Winner: B — '
             "3 primary sources vs A's 1. Graft A's cost table.\" Anti: \"Both "
-            "are good but B is slightly better.\""
+            'are good but B is slightly better."\n\n' + _CHECKER_DISCIPLINE + "\n\n"
+            "OUTPUT CONTRACT — " + _NODE_OUTPUT_SHAPE
         ),
         model=_MAKER_DEFAULT,
         allowed_tools=_fence_tools("judge"),
@@ -253,12 +356,16 @@ def render_internal_role_md(agent: AgentDef) -> str:
     # string — the harness rejects a YAML flow list like `tools: [Read, Grep]`
     # and refuses to launch the role (2026-08-28 adversarial audit, SN-1)
     tools_list = ", ".join(agent.allowed_tools)
+    # `effort` is omitted entirely when unset — an empty value would pin the
+    # role to a level that does not exist rather than inheriting the session.
+    effort_line = f"effort: {agent.effort}\n" if agent.effort else ""
     frontmatter = (
         f"---\n"
         f"name: {agent.name}\n"
         f"description: {_yaml_safe(description)}\n"
         f"tools: {tools_list}\n"
         f"model: {agent.model}\n"
+        f"{effort_line}"
         f"---\n"
     )
     return frontmatter + "\n" + agent.system_prompt + "\n"
@@ -344,59 +451,3 @@ def install_roles(target: Path | None = None, *, dry_run: bool = False) -> dict:
         "written": written,
         "skipped": skipped,
     }
-
-
-# ---------------------------------------------------------------------------
-# Lens callables
-# ---------------------------------------------------------------------------
-
-
-def socratic(raw_intake: str) -> str:
-    """G1-only lens prompt: disambiguate an ambiguous intake, three outcomes.
-
-    The driving session runs this once at `chimera new` time. Outcome maps to
-    SocraticOutcome: proceed-top / ask / parallel-ab. Voice-to-text inputs are
-    the primary target; clean prose should yield proceed-top with no questions.
-    """
-    return f"""You are the Socratic lens — chimera's G1 intake disambiguator.
-
-Raw intake (may contain voice-to-text noise — sound-alike words, run-ons,
-malapropisms):
-{raw_intake}
-
-1. Identify the 2-3 most likely intents this could mean.
-2. Restate the request as it would read under each intent, with likelihoods
-   summing to 100.
-3. Decide ONE outcome:
-   - proceed-top: top interpretation >=75 likely — proceed with it
-   - ask: genuinely ambiguous — emit 1-5 crisp questions (these are posted
-     ONCE to the task's Issue; ask everything now, there is no second round)
-   - parallel-ab: two interpretations both plausible and both cheap — run both
-
-Return JSON: {{"outcome": "proceed-top|ask|parallel-ab",
-"interpretations": [{{"restated": str, "likelihood": int}}],
-"questions": [str, ...], "confidence": 0-100}}
-
-Do not fix the intake; propose interpretations. Fire on ambiguity, not on
-clean prose."""
-
-
-def simplifier(plan_text: str) -> str:
-    """Lens prompt: minimum-that-works review. Fires on plans touching 2+ modules."""
-    return f"""You are the Simplifier lens — chimera's counterweight to
-over-engineering ("naturally reaches for complex architectures when simpler
-ones would work").
-
-Proposed plan:
-{plan_text}
-
-1. Separate load-bearing complexity (earns its place) from optional
-   complexity (added "in case").
-2. Propose the minimum-viable version preserving only the load-bearing parts.
-3. Be honest about what the simpler version loses.
-4. Never strip security/compliance boundaries, tests, trust-boundary error
-   handling, or audit trails to look simpler — those are load-bearing.
-
-Return JSON: {{"keep": [str], "drop": [str], "minimum_viable": str,
-"loses": str, "confidence": 0-100,
-"recommendation": "SHIP MINIMUM|SHIP AS-PROPOSED|NEEDS OPERATOR DECISION"}}"""

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chimera"
-version = "7.1.1"
+version = "7.2.0"
 description = "Chimera v7 — git-durable background task engine driven by Claude Code sessions"
 requires-python = ">=3.11"
 dependencies = [
@@ -34,6 +34,9 @@ pythonpath = ["src"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# Agent worktrees live under .claude/worktrees (gitignored, other checkouts);
+# the widened lint paths must not recurse into them.
+extend-exclude = [".claude/worktrees"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "W", "UP", "B"]

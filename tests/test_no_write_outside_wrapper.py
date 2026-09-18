@@ -25,8 +25,8 @@ def test_arcs_never_checkpoint_or_touch_git():
         for pattern in FORBIDDEN:
             for match in pattern.finditer(text):
                 offenders.append(f"{path.name}: {match.group(0)!r}")
-    assert not offenders, (
-        "arc authors must not own durability — call sites found: " + "; ".join(offenders)
+    assert not offenders, "arc authors must not own durability — call sites found: " + "; ".join(
+        offenders
     )
 
 
@@ -36,8 +36,7 @@ def test_critics_cannot_edit_artifacts():
     moment a critic's model is remapped (M4 pairs research's investigate
     critics off RESEARCH_CRITIC_MODEL, not the global CRITIC_MODEL)."""
     critics = [
-        d for d in {**ROSTER, **{}}.values()
-        if d.name == "critic" or d.name.endswith("-critic")
+        d for d in {**ROSTER, **{}}.values() if d.name == "critic" or d.name.endswith("-critic")
     ]
     assert critics, "roster must declare critics"
     for d in critics:

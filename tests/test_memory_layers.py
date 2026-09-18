@@ -1,4 +1,4 @@
-"""Memory layers 1+2+3 coverage.
+"""Memory layers 1+2 coverage.
 
 Layer 1 — extends memory.cmd_migrate with --source <dir> + --agent so the
 harness auto-memory dir (a single flat dir with MEMORY.md) can be ingested
@@ -9,21 +9,22 @@ Layer 2 — arc_memory.arc_write / arc_search is a universal adapter: any
 arc_kind string is valid, no kinds are hardcoded anywhere. Same
 .claude/memory.db, FTS5 index reused, dedup-on-write preserved.
 
-Layer 3 — role_memory.role_write / role_search mirrors layer 2 shape but
-keyed on (role, role_id). Sleeping infrastructure: no agents.py callable
-wires to it yet; opt-in per role.
+Layer 3 (role memory) was REMOVED 2026-09-02 (audit P2-3 / Q8): 233 lines
+plus ~60 of CLI plumbing with zero callers in eighteen months. Git history
+keeps it; re-add from there on first real need.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 
 import pytest
 
-from chimera import arc_memory, role_memory
+from chimera import arc_memory, memory
 from chimera.memory import _connect, cmd_init, cmd_migrate
-
+from chimera.memory import main as memory_main
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -97,9 +98,7 @@ def test_sweep_flat_source_default_agent_is_user(tmp_path, capsys):
     db = tmp_path / "m.db"
     src = tmp_path / "auto"
     src.mkdir()
-    (src / "MEMORY.md").write_text(
-        "- [Solo entry](solo.md) — only entry\n", encoding="utf-8"
-    )
+    (src / "MEMORY.md").write_text("- [Solo entry](solo.md) — only entry\n", encoding="utf-8")
 
     _init_db_silently(db)
     capsys.readouterr()
@@ -301,32 +300,263 @@ def test_arc_write_rejects_blank_kind_or_id(tmp_path):
     db = tmp_path / "m.db"
     _init_db_silently(db)
     with pytest.raises(ValueError):
-        arc_memory.arc_write(
-            arc_kind="", arc_id="r-1", title="t", body="b", db_path=db
-        )
+        arc_memory.arc_write(arc_kind="", arc_id="r-1", title="t", body="b", db_path=db)
     with pytest.raises(ValueError):
-        arc_memory.arc_write(
-            arc_kind="research", arc_id="", title="t", body="b", db_path=db
-        )
+        arc_memory.arc_write(arc_kind="research", arc_id="", title="t", body="b", db_path=db)
     with pytest.raises(ValueError):
-        arc_memory.arc_write(
-            arc_kind="has space", arc_id="r-1", title="t", body="b", db_path=db
-        )
+        arc_memory.arc_write(arc_kind="has space", arc_id="r-1", title="t", body="b", db_path=db)
 
 
-def test_summarize_run_uses_fixed_title(tmp_path):
+def test_append_run_summary_suffixes_each_attempt(tmp_path):
+    """P1-6: the terminal writers append; they never clobber a prior attempt."""
     db = tmp_path / "m.db"
     _init_db_silently(db)
-    a = arc_memory.summarize_run(
-        arc_kind="research", arc_id="r-1", summary="first take", db_path=db
+    first = arc_memory.append_run_summary(
+        arc_kind="graph", arc_id="g-1", summary="attempt one", db_path=db
     )
-    b = arc_memory.summarize_run(
-        arc_kind="research", arc_id="r-1", summary="revised", db_path=db
+    second = arc_memory.append_run_summary(
+        arc_kind="graph", arc_id="g-1", summary="attempt two", db_path=db
     )
-    # Same id, body updated -> dedup-on-write worked through the convenience.
-    assert a["id"] == b["id"]
-    assert b["title"] == "run-summary"
-    assert b["body"] == "revised"
+    assert first["title"] == "run-summary-1"
+    assert second["title"] == "run-summary-2"
+    assert first["id"] != second["id"]
+    rows = arc_memory.arc_search(arc_kind="graph", arc_id="g-1", db_path=db)
+    assert {r["body"] for r in rows} == {"attempt one", "attempt two"}
+
+
+def test_append_run_summary_counts_per_arc_id(tmp_path):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    arc_memory.append_run_summary(arc_kind="graph", arc_id="g-1", summary="a", db_path=db)
+    other = arc_memory.append_run_summary(arc_kind="graph", arc_id="g-2", summary="b", db_path=db)
+    assert other["title"] == "run-summary-1"
+    assert arc_memory.run_summary_count(arc_kind="graph", arc_id="g-1", db_path=db) == 1
+
+
+# ---------------------------------------------------------------------------
+# L6-F3 / L6-F4 (audit 2026-09-02) — the read commands, driven through
+# argparse, on a machine with no memory DB yet: a framed error, exit 1, and
+# no 0-byte file left behind.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["get"],
+        ["get", "--agent", "chimera"],
+        ["list"],
+        ["search", "anything"],
+        ["arc-search", "anything"],
+    ],
+    ids=["get", "get-filtered", "list", "search", "arc-search"],
+)
+def test_read_commands_on_a_missing_db_die_cleanly(tmp_path, capsys, argv):
+    db = tmp_path / "nope" / "memory.db"
+    with pytest.raises(SystemExit) as exc:
+        memory_main(["--db", str(db), *argv])
+    assert exc.value.code == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: no memory DB yet at ")
+    assert str(db) in err
+    assert not db.exists(), "a read command must not create the DB it did not find"
+    assert not db.parent.exists()
+
+
+def test_read_commands_still_work_once_the_db_exists(tmp_path, capsys):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    with pytest.raises(SystemExit):
+        memory_main(
+            [
+                "--db",
+                str(db),
+                "set",
+                "--agent",
+                "chimera",
+                "--type",
+                "pattern",
+                "--title",
+                "a title",
+                "--body",
+                "a body",
+            ]
+        )
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc:
+        memory_main(["--db", str(db), "list"])
+    assert exc.value.code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["count"] == 1
+    assert payload["rows"][0]["title"] == "a title"
+
+
+# ---------------------------------------------------------------------------
+# Prune (audit 2026-09-02, §5.2 proposal §6) — a retention policy: rows age
+# out by updated_at, feedback/user are exempt unless named, --dry-run reports
+# without deleting, and the FTS index never keeps a pruned row.
+# ---------------------------------------------------------------------------
+
+
+def _seed_row(db_path: Path, *, agent, mem_type, title, body, age_days: int) -> int:
+    with _connect(db_path) as conn:
+        conn.executescript(memory.SCHEMA_SQL)
+        conn.executescript(memory.FTS_SYNC_SQL)
+        cur = conn.execute(
+            """INSERT INTO memories (agent, type, title, body, updated_at)
+               VALUES (?, ?, ?, ?, datetime('now', ?))""",
+            (agent, mem_type, title, body, f"-{age_days} days"),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+
+
+def _prune(db_path: Path, capsys, *argv) -> dict:
+    with pytest.raises(SystemExit) as exc:
+        memory_main(["--db", str(db_path), "prune", *argv])
+    assert exc.value.code == 0, capsys.readouterr().err
+    return json.loads(capsys.readouterr().out)
+
+
+def _titles(db_path: Path) -> set[str]:
+    with _connect(db_path) as conn:
+        return {r["title"] for r in conn.execute("SELECT title FROM memories")}
+
+
+def _seed_mixed(db_path: Path) -> None:
+    _seed_row(
+        db_path,
+        agent="arc",
+        mem_type="pattern",
+        title="old pattern",
+        body="stale run summary",
+        age_days=200,
+    )
+    _seed_row(
+        db_path,
+        agent="arc",
+        mem_type="pattern",
+        title="new pattern",
+        body="fresh run summary",
+        age_days=1,
+    )
+    _seed_row(
+        db_path,
+        agent="user",
+        mem_type="feedback",
+        title="old feedback",
+        body="always cite sources",
+        age_days=400,
+    )
+    _seed_row(
+        db_path,
+        agent="user",
+        mem_type="user",
+        title="old user note",
+        body="prefers terse output",
+        age_days=400,
+    )
+    _seed_row(
+        db_path,
+        agent="chimera",
+        mem_type="project",
+        title="old project",
+        body="project decision",
+        age_days=200,
+    )
+
+
+def test_prune_deletes_by_age_and_spares_feedback_and_user(tmp_path, capsys):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    capsys.readouterr()
+    _seed_mixed(db)
+
+    out = _prune(db, capsys, "--older-than-days", "30")
+    assert out["deleted"] == 2
+    assert out["by_type"] == {"pattern": 1, "project": 1}
+    assert sorted(out["protected_types"]) == ["feedback", "user"]
+    assert _titles(db) == {"new pattern", "old feedback", "old user note"}
+
+
+def test_prune_dry_run_deletes_nothing(tmp_path, capsys):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    capsys.readouterr()
+    _seed_mixed(db)
+
+    out = _prune(db, capsys, "--older-than-days", "30", "--dry-run")
+    assert out["dry_run"] is True
+    assert out["matched"] == 2 and out["deleted"] == 0
+    assert len(_titles(db)) == 5
+
+
+def test_prune_type_overrides_the_protected_exemption(tmp_path, capsys):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    capsys.readouterr()
+    _seed_mixed(db)
+
+    out = _prune(db, capsys, "--older-than-days", "30", "--type", "feedback")
+    assert out["deleted"] == 1
+    assert out["protected_types"] == []
+    assert "old feedback" not in _titles(db)
+    assert "old pattern" in _titles(db)  # --type narrows to exactly one type
+
+
+def test_prune_keeps_the_fts_index_in_sync(tmp_path, capsys):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    capsys.readouterr()
+    _seed_row(
+        db,
+        agent="arc",
+        mem_type="pattern",
+        title="old pattern",
+        body="obsoletetoken lives here",
+        age_days=200,
+    )
+
+    with _connect(db) as conn:
+        hits = conn.execute(
+            "SELECT COUNT(*) AS n FROM memories_fts WHERE memories_fts MATCH ?",
+            ("obsoletetoken",),
+        ).fetchone()["n"]
+    assert hits == 1
+
+    _prune(db, capsys, "--older-than-days", "30")
+
+    with _connect(db) as conn:
+        hits = conn.execute(
+            "SELECT COUNT(*) AS n FROM memories_fts WHERE memories_fts MATCH ?",
+            ("obsoletetoken",),
+        ).fetchone()["n"]
+    assert hits == 0, "FTS index still matches a pruned row"
+
+
+def test_prune_rejects_bad_arguments(tmp_path, capsys):
+    db = tmp_path / "m.db"
+    _init_db_silently(db)
+    capsys.readouterr()
+
+    with pytest.raises(SystemExit) as exc:
+        memory_main(["--db", str(db), "prune", "--older-than-days", "0"])
+    assert exc.value.code == 1
+    assert "--older-than-days must be >= 1" in capsys.readouterr().err
+
+    with pytest.raises(SystemExit) as exc:
+        memory_main(["--db", str(db), "prune", "--older-than-days", "30", "--type", "bogus"])
+    assert exc.value.code == 1
+    assert "invalid --type" in capsys.readouterr().err
+
+
+def test_prune_on_a_missing_db_dies_cleanly(tmp_path, capsys):
+    db = tmp_path / "nope" / "m.db"
+    with pytest.raises(SystemExit) as exc:
+        memory_main(["--db", str(db), "prune", "--older-than-days", "30"])
+    assert exc.value.code == 1
+    assert "no memory DB yet at" in capsys.readouterr().err
+    assert not db.exists()
 
 
 def test_existing_db_without_arc_columns_is_upgraded(tmp_path, capsys):
@@ -369,210 +599,6 @@ def test_existing_db_without_arc_columns_is_upgraded(tmp_path, capsys):
 
 
 # ---------------------------------------------------------------------------
-# Phase 3: role memory universal adapter (sleeping)
-# ---------------------------------------------------------------------------
-
-
-def test_role_write_creates_row(tmp_path):
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    row = role_memory.role_write(
-        role="contrarian-critic",
-        role_id="global",
-        title="schema-refute",
-        body="grounding refutations in the JSON schema beat prose 3:1",
-        tags="tactic,refute",
-        db_path=db,
-    )
-    assert row["agent"] == "role"
-    assert row["type"] == "pattern"
-    assert row["role"] == "contrarian-critic"
-    assert row["role_id"] == "global"
-    assert row["title"] == "schema-refute"
-    assert row["tags"] == "tactic,refute"
-
-
-def test_role_write_accepts_unknown_role(tmp_path):
-    """Same universal-adapter contract as arc_memory — any role string."""
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    row = role_memory.role_write(
-        role="hypothetical-role-y",
-        role_id="hy-1",
-        title="proof",
-        body="adapter took an unknown role without complaint",
-        db_path=db,
-    )
-    assert row["role"] == "hypothetical-role-y"
-
-
-def test_role_write_dedup_on_role_id_title(tmp_path):
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    first = role_memory.role_write(
-        role="simplifier", role_id="global", title="rule-one", body="v1", db_path=db
-    )
-    second = role_memory.role_write(
-        role="simplifier", role_id="global", title="rule-one", body="v2", db_path=db
-    )
-    assert first["id"] == second["id"]
-    assert second["body"] == "v2"
-
-    rows = role_memory.role_search(role="simplifier", role_id="global", db_path=db)
-    assert len(rows) == 1
-
-
-def test_role_search_filters_by_role(tmp_path):
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    for role in ("contrarian-critic", "simplifier", "hypothetical-role-y"):
-        role_memory.role_write(
-            role=role,
-            role_id="global",
-            title=f"{role}-note",
-            body=f"something about {role}",
-            db_path=db,
-        )
-
-    critic = role_memory.role_search(role="contrarian-critic", db_path=db)
-    assert len(critic) == 1 and critic[0]["role"] == "contrarian-critic"
-
-    hypo = role_memory.role_search(role="hypothetical-role-y", db_path=db)
-    assert len(hypo) == 1 and hypo[0]["role"] == "hypothetical-role-y"
-
-    all_roles = role_memory.role_search(db_path=db)
-    assert len(all_roles) == 3
-
-
-def test_role_search_fts_query_finds_role_rows(tmp_path):
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    role_memory.role_write(
-        role="contrarian-critic",
-        role_id="global",
-        title="refute-tactic",
-        body="anchoring the refutation in the schema beat prose every time",
-        db_path=db,
-    )
-    role_memory.role_write(
-        role="simplifier",
-        role_id="global",
-        title="trim-pattern",
-        body="lorem ipsum unrelated noise here",
-        db_path=db,
-    )
-
-    hits = role_memory.role_search(query="schema", db_path=db)
-    assert len(hits) == 1
-    assert hits[0]["role"] == "contrarian-critic"
-
-
-def test_role_search_isolates_from_user_and_arc(tmp_path, capsys):
-    """role_search must return ONLY role rows, never user or arc rows."""
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-
-    src = tmp_path / "auto"
-    src.mkdir()
-    (src / "MEMORY.md").write_text(
-        "- [User note](project_x.md) — anchor word in user memory\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(SystemExit):
-        _migrate_flat(db, src, agent="user")
-    capsys.readouterr()
-
-    arc_memory.arc_write(
-        arc_kind="research",
-        arc_id="r-1",
-        title="arc note",
-        body="the same anchor word in arc memory",
-        db_path=db,
-    )
-
-    role_memory.role_write(
-        role="contrarian-critic",
-        role_id="global",
-        title="role note",
-        body="the same anchor word in role memory",
-        db_path=db,
-    )
-
-    role_hits = role_memory.role_search(query="anchor", db_path=db)
-    assert len(role_hits) == 1
-    assert role_hits[0]["agent"] == "role"
-
-
-def test_role_write_rejects_blank_role_or_id(tmp_path):
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    with pytest.raises(ValueError):
-        role_memory.role_write(role="", role_id="g", title="t", body="b", db_path=db)
-    with pytest.raises(ValueError):
-        role_memory.role_write(
-            role="contrarian-critic", role_id="", title="t", body="b", db_path=db
-        )
-    with pytest.raises(ValueError):
-        role_memory.role_write(
-            role="has space", role_id="g", title="t", body="b", db_path=db
-        )
-
-
-def test_summarize_role_uses_fixed_title(tmp_path):
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-    a = role_memory.summarize_role(
-        role="contrarian-critic", role_id="global", summary="first take", db_path=db
-    )
-    b = role_memory.summarize_role(
-        role="contrarian-critic", role_id="global", summary="revised", db_path=db
-    )
-    assert a["id"] == b["id"]
-    assert b["title"] == "role-summary"
-    assert b["body"] == "revised"
-
-
-def test_existing_db_without_role_columns_is_upgraded(tmp_path):
-    """Pre-Phase-3 DB (no role/role_id columns) must be upgraded in place."""
-    import sqlite3
-
-    db = tmp_path / "m.db"
-    conn = sqlite3.connect(str(db))
-    conn.executescript(
-        """
-        CREATE TABLE memories (
-            id INTEGER PRIMARY KEY,
-            agent TEXT NOT NULL,
-            type TEXT,
-            title TEXT NOT NULL,
-            body TEXT NOT NULL,
-            tags TEXT,
-            source_file TEXT,
-            created_at TEXT NOT NULL DEFAULT (datetime('now')),
-            updated_at TEXT NOT NULL DEFAULT (datetime('now'))
-        );
-        """
-    )
-    conn.commit()
-    conn.close()
-
-    role_memory.role_write(
-        role="contrarian-critic",
-        role_id="global",
-        title="post-upgrade",
-        body="should have triggered ALTER TABLE for role columns",
-        db_path=db,
-    )
-
-    with _connect(db) as conn:
-        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
-    assert "role" in cols
-    assert "role_id" in cols
-    assert "arc_kind" in cols
-    assert "arc_id" in cols
-
-
-# ---------------------------------------------------------------------------
 # Layer coexistence
 # ---------------------------------------------------------------------------
 
@@ -585,8 +611,7 @@ def test_layer1_and_layer2_share_db_cleanly(tmp_path, capsys):
     src = tmp_path / "auto"
     src.mkdir()
     (src / "MEMORY.md").write_text(
-        "- [User one](project_one.md) — one\n"
-        "- [User two](feedback_two.md) — two\n",
+        "- [User one](project_one.md) — one\n- [User two](feedback_two.md) — two\n",
         encoding="utf-8",
     )
     with pytest.raises(SystemExit):
@@ -609,52 +634,8 @@ def test_layer1_and_layer2_share_db_cleanly(tmp_path, capsys):
     arc_rows = [r for r in rows if r["agent"] == "arc"]
     assert len(user_rows) == 2 and len(arc_rows) == 3
 
-
-def test_all_three_layers_share_db_cleanly(tmp_path, capsys):
-    """Layers 1 + 2 + 3 coexist in the same DB with no cross-contamination."""
-    db = tmp_path / "m.db"
-    _init_db_silently(db)
-
-    src = tmp_path / "auto"
-    src.mkdir()
-    (src / "MEMORY.md").write_text(
-        "- [User one](project_one.md) — one\n"
-        "- [User two](feedback_two.md) — two\n",
-        encoding="utf-8",
-    )
-    with pytest.raises(SystemExit):
-        _migrate_flat(db, src, agent="user")
-    capsys.readouterr()
-
-    arc_memory.arc_write(
-        arc_kind="research", arc_id="r-1", title="a", body="x", db_path=db
-    )
-    arc_memory.arc_write(
-        arc_kind="research", arc_id="r-2", title="b", body="y", db_path=db
-    )
-    arc_memory.arc_write(
-        arc_kind="design", arc_id="d-1", title="c", body="z", db_path=db
-    )
-
-    role_memory.role_write(
-        role="contrarian-critic", role_id="global", title="t1", body="b1", db_path=db
-    )
-    role_memory.role_write(
-        role="simplifier", role_id="global", title="t2", body="b2", db_path=db
-    )
-
-    rows = _all_rows(db)
-    assert len(rows) == 7
-
-    by_agent = {}
-    for r in rows:
-        by_agent.setdefault(r["agent"], []).append(r)
-    assert len(by_agent["user"]) == 2
-    assert len(by_agent["arc"]) == 3
-    assert len(by_agent["role"]) == 2
-
+    # arc_search sees every arc row across kinds and no layer-1 row.
     assert len(arc_memory.arc_search(db_path=db)) == 3
-    assert len(role_memory.role_search(db_path=db)) == 2
 
 
 # ---------------------------------------------------------------------------

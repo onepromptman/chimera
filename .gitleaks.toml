@@ -1,0 +1,79 @@
+# gitleaks config for chimera — the tracked half of the push boundary.
+#
+# This file is tracked, and chimera has a public mirror, so it deliberately
+# names NO employer, person, vendor or internal tool. The token list that does
+# name them is untracked and machine-local:
+#
+#     ~/.config/chimera/leak-tokens.txt      (one regex per line, # comments ok)
+#
+# The `boundary-tokens` hook in .pre-commit-config.yaml reads that file if it
+# exists and is a no-op if it does not; the same idea backs the optional
+# machine-local pre-push guard and the mirror-audit skill. See CONTRIBUTING.md → "Boundary".
+#
+# What lives here instead: the default gitleaks ruleset (real credentials) plus
+# three repo-shaped rules that encode chimera's own Security Rules.
+
+title = "chimera boundary + secret rules"
+
+[extend]
+useDefault = true
+
+# --- Security Rule #2: never commit .env or .mcp.json -------------------------
+# Both are gitignored; this catches a `git add -f` or a rewritten .gitignore.
+[[rules]]
+id = "chimera-forbidden-config-file"
+description = "Credential-bearing config file committed (.env* / .mcp.json)"
+path = '''(^|/)(\.env(\.[^/]*)?|\.mcp\.json)$'''
+tags = ["chimera", "boundary", "security-rule-2"]
+
+  [rules.allowlist]
+  description = "The checked-in template holds placeholders only"
+  paths = ['''(^|/)\.env\.example$''']
+
+# --- Security Rules #2/#3: a real provider credential, inline -----------------
+# Keyword-anchored so it fires on an assignment, not on prose.
+[[rules]]
+id = "chimera-provider-credential-assignment"
+description = "Provider API key / token / webhook assigned a literal value"
+regex = '''(?i)\b[a-z0-9_-]*(?:api[_-]?key|auth[_-]?token|access[_-]?token|client[_-]?secret|webhook[_-]?url)\s*[:=]\s*['"]?([A-Za-z0-9_\-./:]{20,})['"]?'''
+secretGroup = 1
+entropy = 3.0
+tags = ["chimera", "credential", "security-rule-3"]
+
+  [rules.allowlist]
+  description = "Templates, docs and the env-var names chimera reads"
+  regexTarget = "match"
+  paths = ['''(^|/)\.env\.example$''']
+  regexes = [
+    # Placeholders and the documented shape of a value, not a value.
+    '''(?i)(your|example|placeholder|redacted|dummy|changeme|xxx+|\.\.\.|<[^>]+>)''',
+    # `CHIMERA_*` levers are variable NAMES; the package holds no tokens.
+    '''(?i)CHIMERA_[A-Z_]+\s*[:=]\s*$''',
+  ]
+
+# --- ADR-006 / Security Rule #9: personnel-data path leaking into tracked space
+# The directory name is already in the tracked .gitignore, so naming it here
+# discloses nothing new; a reference to it from tracked space means work
+# content is being written where the path-shaped protection does not reach.
+[[rules]]
+id = "chimera-personnel-data-path"
+description = "Reference to the gitignored personnel-data zone from tracked space"
+regex = '''(?i)\bintern-conversions\b'''
+tags = ["chimera", "boundary", "adr-006"]
+
+  [rules.allowlist]
+  description = "The two files whose job is to name the zone"
+  paths = [
+    '''(^|/)\.gitignore$''',
+    '''(^|/)\.gitleaks\.toml$''',
+  ]
+
+# --- Global allowlist ---------------------------------------------------------
+[allowlist]
+description = "Machine-generated or self-referential files"
+paths = [
+  # Every line is a sha256 wheel hash; nothing here is a secret.
+  '''(^|/)requirements\.lock$''',
+  # This file quotes its own patterns.
+  '''(^|/)\.gitleaks\.toml$''',
+]

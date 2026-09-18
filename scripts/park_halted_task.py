@@ -7,6 +7,7 @@ by tick.
 
 Usage: PYTHONPATH=src python scripts/park_halted_task.py <task_id> [note]
 """
+
 import sys
 from pathlib import Path
 
@@ -26,7 +27,7 @@ def park(task_id: str, note: str) -> None:
     r = q.transition(
         task_id,
         "awaiting-signoff",
-        by="operator",
+        by="layer3-validation",
         note=note,
     )
     print(f"Transitioned to: {r.state}")
@@ -37,5 +38,5 @@ if __name__ == "__main__":
         print("Usage: park_halted_task.py <task_id> [note]")
         sys.exit(1)
     task_id = sys.argv[1]
-    note = sys.argv[2] if len(sys.argv) > 2 else "halted arc parked by the operator"
+    note = sys.argv[2] if len(sys.argv) > 2 else "halted arc parked to unblock sequential 3b/3c run"
     park(task_id, note)

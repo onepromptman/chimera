@@ -4,11 +4,21 @@
   },
   "extraKnownMarketplaces": {
     "n8n-io": {
-      "source": { "source": "github", "repo": "n8n-io/skills" }
+      "source": {
+        "source": "github",
+        "repo": "n8n-io/skills"
+      }
+    },
+    "claude-plugins-official": {
+      "source": {
+        "source": "github",
+        "repo": "anthropics/claude-plugins-official"
+      }
     }
   },
   "enabledPlugins": {
-    "n8n-skills@n8n-io": true
+    "n8n-skills@n8n-io": true,
+    "security-guidance@claude-plugins-official": true
   },
   "hooks": {
     "PreToolUse": [
@@ -18,6 +28,15 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/router-enforcer.py\""
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 \"$CLAUDE_PROJECT_DIR/.claude/hooks/push-scope-advisor.py\""
           }
         ]
       }

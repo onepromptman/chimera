@@ -1,6 +1,6 @@
 """Git plumbing for durable state.
 
-Durable-state-first: every queue transition and every
+Durable-state-first (fire-drill lesson): every queue transition and every
 materialized artifact is committed immediately; push is best-effort with
 exponential backoff so a network blip degrades to a later push, never to
 lost work.
@@ -59,6 +59,21 @@ def _run(cmd: list[str], cwd: Path) -> str:
 
 def current_branch(root: Path) -> str:
     return _run(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=root).strip()
+
+
+def show_at_head(root: Path, rel_path: str) -> str | None:
+    """The contents of *rel_path* as COMMITTED at HEAD, or None when HEAD
+    carries no such blob (unborn branch, not-yet-committed file, no repo).
+
+    For callers that must not trust a locally-writable file: the worker
+    session writes the working tree on every transition, so a working-tree
+    read is the session's own word. A committed blob is history — tampering
+    with it costs a commit that shows up in the log and in the push.
+    """
+    try:
+        return _run(["git", "show", f"HEAD:{rel_path}"], cwd=root)
+    except (GitError, OSError):
+        return None
 
 
 def commit(root: Path, paths: list[Path], message: str) -> str | None:
@@ -125,29 +140,3 @@ def push_health(root: Path) -> dict:
     if count:
         health["note"] = f"{count} commit(s) not on {upstream} — pushes may be failing"
     return health
-
-
-def _remote_host(url: str) -> str | None:
-    """Host portion of a git remote URL, or None if unparseable. Handles
-    scp-style (git@host:owner/repo), ssh:// and https:// forms."""
-    url = url.strip()
-    if not url:
-        return None
-    if "://" in url:  # ssh://git@host/... or https://host/...
-        after = url.split("://", 1)[1]
-        authority = after.split("/", 1)[0]
-        return authority.rsplit("@", 1)[-1].split(":", 1)[0] or None
-    if "@" in url and ":" in url:  # scp-style git@host:owner/repo.git
-        return url.split("@", 1)[1].split(":", 1)[0] or None
-    return None
-
-
-def push_remote_host(root: Path) -> str | None:
-    """Host of origin's push URL (e.g. 'github.com'), or None if there is no
-    remote / it can't be read. Used by the n8n local_only intake guard to
-    refuse opening a work-only task in a public checkout."""
-    try:
-        url = _run(["git", "remote", "get-url", "--push", "origin"], cwd=root).strip()
-    except GitError:
-        return None
-    return _remote_host(url)

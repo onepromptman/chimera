@@ -63,7 +63,16 @@ def test_env_changed_after_import_reaches_the_guard(monkeypatch):
     monkeypatch.setenv("CHIMERA_MAKER_MODEL", "same-model")
     monkeypatch.setenv("CHIMERA_CRITIC_MODEL", "same-model")
     with pytest.raises(MakerCheckerViolation):
-        lite.assert_maker_neq_checker()
+        lite.assert_panel_models_differ()
+
+
+def test_judge_differs_from_critic_under_default_env():
+    """Replaces the deleted judge_tier_warning(): under the default posture
+    (judge rides the maker alias, S2/S4 2026-09-16) judge and critic are
+    already distinct models, so no separate runtime warning is needed — this
+    pins the invariant the warning used to guard at runtime."""
+    m = resolve_models()
+    assert m.judge != m.critic
 
 
 def test_installed_role_files_carry_current_models(monkeypatch, tmp_path):

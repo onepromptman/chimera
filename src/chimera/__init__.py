@@ -6,4 +6,4 @@ state lives in git — every transition is a commit, so an ephemeral
 container dying mid-arc costs nothing but the uncommitted in-flight call.
 """
 
-__version__ = "7.1.1"  # kept in lockstep with pyproject.toml (tested)
+__version__ = "7.2.0"  # kept in lockstep with pyproject.toml (tested)

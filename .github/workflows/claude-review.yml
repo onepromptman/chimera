@@ -1,0 +1,72 @@
+# AI review on every pull request, on the operator's Claude SUBSCRIPTION (no
+# API key): the Claude Code GitHub Action authenticates with an OAuth token
+# generated once by `claude setup-token` and stored as the repository secret
+# CLAUDE_CODE_OAUTH_TOKEN. Until that secret exists the steps skip and the job
+# passes, so this is never a permanently red check. Two passes:
+#   code-review     — the official code-review plugin, inline comments (--comment)
+#   security-review — Claude Code's bundled /security-review over the PR diff,
+#                     posted as a summary comment
+# Pinned by full commit SHA (tag v1 → fa2b2666…, resolved with git ls-remote).
+# Fork PRs get no secrets on GitHub, so the review runs for same-repo PRs only.
+#
+# Permissions: both passes exist to POST — inline review comments and one issue
+# comment — which upstream's documented pattern grants as `pull-requests: write`
+# + `issues: write`; at `read` the posts fail and the review is a silent no-op.
+# The write is scoped to comments by the allowedTools list on each step (the
+# inline-comment and add_issue_comment MCP tools, nothing else): this token
+# never pushes code, never merges, never edits a PR body, and `contents` stays
+# read.
+name: claude-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+  id-token: write
+
+concurrency:
+  group: claude-review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    if: github.event.pull_request.draft == false
+    env:
+      CLAUDE_CODE_OAUTH_TOKEN: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 1
+      - name: Code review (official plugin, inline comments)
+        if: env.CLAUDE_CODE_OAUTH_TOKEN != ''
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          plugin_marketplaces: "https://github.com/anthropics/claude-code.git"
+          plugins: "code-review@claude-code-plugins"
+          prompt: "/code-review:code-review --comment ${{ github.repository }}/pull/${{ github.event.pull_request.number }}"
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment" --max-turns 30'
+      - name: Security review (bundled /security-review, summary comment)
+        if: env.CLAUDE_CODE_OAUTH_TOKEN != ''
+        uses: anthropics/claude-code-action@fa2b2666b747000bf42767d1f332065b375e3c8f # v1
+        with:
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          prompt: |
+            Run /security-review on pull request ${{ github.repository }}#${{ github.event.pull_request.number }}
+            (the diff of this PR against its base). Then post ONE comment on the PR:
+            a short list of findings ranked by severity with file:line, or the single
+            line "Security review: no findings." if there are none. Chimera-specific
+            checks to include: work-adjacent or personal content in tracked files
+            (CLAUDE.md Security Rule 1), any secret or token in the tree (Rule 2),
+            subprocess/eval/yaml.load misuse (Rules 5-7), a compound write+shell or
+            write+network tool grant in agents or role files, and any change that
+            weakens the G2 operator-token gate or the push-scope hook.
+          claude_args: '--allowedTools "mcp__github_inline_comment__create_inline_comment,mcp__github__add_issue_comment" --max-turns 30'
+      - name: Not configured
+        if: env.CLAUDE_CODE_OAUTH_TOKEN == ''
+        run: echo "CLAUDE_CODE_OAUTH_TOKEN is not set; run 'claude setup-token' locally and add it as a repository secret to enable AI review."

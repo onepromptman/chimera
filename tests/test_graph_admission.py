@@ -1,7 +1,7 @@
-"""The graph layer's pure logic: fences, levers, admission, budget, model
-derivation. State-machine behavior lives in test_graph_arc.py.
+"""The graph layer's pure logic: fences, levers, admission, call estimation,
+model derivation. State-machine behavior lives in test_graph_arc.py.
 
-Written adversarially, like the autonomy suite that inspired the
+Written adversarially, like the icarus autonomy suite that inspired the
 levers: the attacker's list first (compound grants, typo'd levers, cycles by
 another name), the operator's list second (every refusal names its lever)."""
 
@@ -12,29 +12,36 @@ from typing import get_args
 import pytest
 from pydantic import ValidationError
 
-from chimera import graph, levers, roles
+from chimera import graph, levers
 from chimera.agents import ROSTER, resolve_models
 from chimera.graph import GraphAdmissionError, admit, estimated_calls, node_model
 from chimera.levers import GraphLevers, graph_levers
 from chimera.models import GRAPH_CHECKER_ROLES, GraphNode, GraphPlan, GraphRole
 from chimera.roles import FENCES, ROSTER_NAME, FenceViolation, RoleFence, fence_for
 
-DEFAULTS = GraphLevers(width_max=3, phases_max=5, call_budget=40, repair_laps=1)
+DEFAULTS = GraphLevers(width_max=3, phases_max=5, repair_laps=1)
 
 
 def _plan(phases: list[dict]) -> GraphPlan:
     return GraphPlan(goal="demo goal", rationale="demo shape", phases=phases)
 
 
-def _node(id: str, role: str = "researcher", tier: str = "fast", reads: list[str] | None = None) -> dict:
+def _node(
+    id: str, role: str = "researcher", tier: str = "fast", reads: list[str] | None = None
+) -> dict:
     return {"id": id, "role": role, "tier": tier, "brief": f"do {id}", "reads": reads or []}
 
 
 def _diamond() -> GraphPlan:
-    return _plan([
-        {"name": "gather", "nodes": [_node("gather-a"), _node("gather-b")]},
-        {"name": "merge", "nodes": [_node("judge-gathers", role="judge", reads=["gather-a", "gather-b"])]},
-    ])
+    return _plan(
+        [
+            {"name": "gather", "nodes": [_node("gather-a"), _node("gather-b")]},
+            {
+                "name": "merge",
+                "nodes": [_node("judge-gathers", role="judge", reads=["gather-a", "gather-b"])],
+            },
+        ]
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -63,7 +70,8 @@ def test_mcp_tools_classify_as_network_so_write_plus_mcp_is_unconstructible():
         role="researcher",
         tools=("Read", "Grep", "Glob", "WebFetch", "WebSearch", "mcp__exa__web_search_exa"),
     )
-    assert fence.has_network and not fence.can_write and not fence.has_shell
+    assert "mcp__exa__web_search_exa" in fence.tools  # network, by classification
+    assert not fence.can_write and "Bash" not in fence.tools
 
 
 def test_every_fence_in_the_table_constructs_and_derives_honestly():
@@ -71,7 +79,6 @@ def test_every_fence_in_the_table_constructs_and_derives_honestly():
         assert fence.role == role
         # capability is derived, so a fence cannot disagree with itself
         assert fence.can_write == bool({"Write", "Edit", "NotebookEdit"} & set(fence.tools))
-        assert fence.has_shell == ("Bash" in fence.tools)
 
 
 def test_checker_and_planner_roles_cannot_write():
@@ -79,10 +86,10 @@ def test_checker_and_planner_roles_cannot_write():
         assert not FENCES[role].can_write, f"{role} must not hold a write tool"
 
 
-def test_executor_has_shell_but_no_write_and_maker_the_inverse():
-    assert FENCES["executor"].has_shell and not FENCES["executor"].can_write
-    assert FENCES["maker"].can_write and not FENCES["maker"].has_shell
-    assert not FENCES["maker"].has_network
+def test_executor_holds_the_shell_but_no_write_and_maker_the_inverse():
+    assert "Bash" in FENCES["executor"].tools and not FENCES["executor"].can_write
+    assert FENCES["maker"].can_write and "Bash" not in FENCES["maker"].tools
+    assert not {"WebFetch", "WebSearch"} & set(FENCES["maker"].tools)
 
 
 def test_fence_table_covers_exactly_the_role_literal():
@@ -93,7 +100,7 @@ def test_fence_table_covers_exactly_the_role_literal():
 def test_distinct_grant_count_is_measured_not_asserted():
     # 6 roles over 4 distinct grants: read-only (planner/judge),
     # read+web (researcher/critic), write (maker), shell (executor).
-    assert roles.distinct_grants() == 4
+    assert len({frozenset(f.tools) for f in FENCES.values()}) == 4
 
 
 def test_unknown_role_raises():
@@ -114,7 +121,7 @@ def test_roster_mapping_members_fit_inside_their_fence():
 
 
 def test_roster_name_is_identity_since_the_consolidation():
-    """The roster IS the six roles, so the mapping is identity —
+    """The roster IS the six roles (ADR-010), so the mapping is identity —
     including executor, whose shell-holding roster member now exists with
     exactly the fence grant."""
     assert ROSTER_NAME == {role: role for role in FENCES}
@@ -126,11 +133,14 @@ def test_roster_name_is_identity_since_the_consolidation():
 
 
 def test_lever_defaults_are_the_restrictive_posture(monkeypatch):
-    for name in ("CHIMERA_GRAPH_WIDTH", "CHIMERA_GRAPH_PHASES",
-                 "CHIMERA_GRAPH_CALL_BUDGET", "CHIMERA_GRAPH_REPAIR_LAPS"):
+    for name in (
+        "CHIMERA_GRAPH_WIDTH",
+        "CHIMERA_GRAPH_PHASES",
+        "CHIMERA_GRAPH_REPAIR_LAPS",
+    ):
         monkeypatch.delenv(name, raising=False)
     lv = graph_levers()
-    assert (lv.width_max, lv.phases_max, lv.call_budget, lv.repair_laps) == (3, 5, 40, 1)
+    assert (lv.width_max, lv.phases_max, lv.repair_laps) == (3, 5, 1)
 
 
 @pytest.mark.parametrize("bad", ["five", "3.0", "-1", "", " 4", "4 ", "+4", "0x4"])
@@ -156,7 +166,7 @@ def test_a_deliberate_widening_is_honored(monkeypatch):
 
 def test_hard_caps_hold_regardless_of_lever():
     assert levers.GRAPH_WIDTH_HARD_MAX == 8
-    assert levers.GRAPH_CALL_BUDGET_HARD_MAX == 250  # the runner ceiling
+    assert levers.GRAPH_PHASES_HARD_MAX == 10
 
 
 def test_graph_module_reads_no_environment():
@@ -189,66 +199,103 @@ def test_the_modest_diamond_admits_unchanged():
 
 
 def test_width_refusal_names_the_lever():
-    plan = _plan([{"name": "wide", "nodes": [_node(f"n-{i}") for i in range(4)]},
-                  {"name": "merge", "nodes": [_node("m", role="judge", reads=[f"n-{i}" for i in range(4)])]}])
+    plan = _plan(
+        [
+            {"name": "wide", "nodes": [_node(f"n-{i}") for i in range(4)]},
+            {
+                "name": "merge",
+                "nodes": [_node("m", role="judge", reads=[f"n-{i}" for i in range(4)])],
+            },
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="CHIMERA_GRAPH_WIDTH"):
         admit(plan, DEFAULTS)
     # the same plan admits once the operator widens deliberately
-    admit(plan, GraphLevers(width_max=4, phases_max=5, call_budget=40, repair_laps=1))
+    admit(plan, GraphLevers(width_max=4, phases_max=5, repair_laps=1))
 
 
 def test_phase_refusal_names_the_lever():
-    phases = [{"name": f"p-{i}", "nodes": [_node(f"n-{i}", role="maker", tier="frontier")]} for i in range(6)]
+    phases = [
+        {"name": f"p-{i}", "nodes": [_node(f"n-{i}", role="maker", tier="frontier")]}
+        for i in range(6)
+    ]
     with pytest.raises(GraphAdmissionError, match="CHIMERA_GRAPH_PHASES"):
         admit(_plan(phases), DEFAULTS)
 
 
-def test_budget_refusal_names_the_lever():
-    plan = _diamond()
-    tight = GraphLevers(width_max=3, phases_max=5, call_budget=5, repair_laps=1)
-    with pytest.raises(GraphAdmissionError, match="CHIMERA_GRAPH_CALL_BUDGET"):
-        admit(plan, tight)
-
-
 def test_estimated_calls_is_the_documented_formula():
+    """2026-09-16: overhead dropped the pre-charged re-plan allowance and the
+    panel shrank 3 -> 2 critics (S1/S2). overhead_calls(repair_laps) =
+    _PLAN_CALLS + _WRAP_CALLS + _VERIFY_PANEL + repair_laps*(_WRAP_CALLS +
+    _VERIFY_PANEL) = 1 + 1 + 2 + repair_laps*(1+2)."""
     plan = _diamond()  # 3 nodes
-    # plan(1) + replan allowance(1) + nodes(3) + wrap(1) + panel(3) + 1 lap*(1+3)
-    assert estimated_calls(plan, repair_laps=1) == 13
-    assert estimated_calls(plan, repair_laps=0) == 9
+    assert estimated_calls(plan, repair_laps=1) == 10  # overhead 7 + 3 nodes
+    assert estimated_calls(plan, repair_laps=0) == 7  # overhead 4 + 3 nodes
+
+
+def test_estimated_calls_charges_one_mutant_call_once():
+    """The seeded-mutant control is +1 call on a credentialed run, charged
+    ONCE — it is dispatched at lap 0 only, so a repair lap never re-charges
+    it. The parameter defaults to 0, so an uncredentialed run's estimate is
+    exactly what it was."""
+    plan = _diamond()  # 3 nodes
+    assert estimated_calls(plan, repair_laps=1) == estimated_calls(
+        plan, repair_laps=1, mutant_calls=0
+    )
+    assert estimated_calls(plan, repair_laps=1, mutant_calls=1) == 11
+    # three repair laps, still ONE control call
+    assert (
+        estimated_calls(plan, repair_laps=3, mutant_calls=1) - estimated_calls(plan, repair_laps=3)
+        == 1
+    )
+    assert graph.overhead_calls(1, 1) - graph.overhead_calls(1) == 1
 
 
 def test_unknown_read_is_refused():
-    plan = _plan([
-        {"name": "gather", "nodes": [_node("gather-a")]},
-        {"name": "merge", "nodes": [_node("m", role="judge", reads=["ghost-node"])]},
-    ])
+    plan = _plan(
+        [
+            {"name": "gather", "nodes": [_node("gather-a")]},
+            {"name": "merge", "nodes": [_node("m", role="judge", reads=["ghost-node"])]},
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="unknown node 'ghost-node'"):
         admit(plan, DEFAULTS)
 
 
 def test_same_phase_read_is_refused_cycles_are_unrepresentable():
-    plan = _plan([
-        {"name": "one", "nodes": [_node("a", role="maker", tier="frontier"),
-                                    _node("b", role="critic", reads=["a"])]},
-    ])
+    plan = _plan(
+        [
+            {
+                "name": "one",
+                "nodes": [
+                    _node("a", role="maker", tier="frontier"),
+                    _node("b", role="critic", reads=["a"]),
+                ],
+            },
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="strictly earlier"):
         admit(plan, DEFAULTS)
 
 
 def test_later_phase_read_is_refused():
-    plan = _plan([
-        {"name": "one", "nodes": [_node("early", role="critic", reads=["late"])]},
-        {"name": "two", "nodes": [_node("late", role="maker", tier="frontier")]},
-    ])
+    plan = _plan(
+        [
+            {"name": "one", "nodes": [_node("early", role="critic", reads=["late"])]},
+            {"name": "two", "nodes": [_node("late", role="maker", tier="frontier")]},
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="strictly earlier"):
         admit(plan, DEFAULTS)
 
 
 def test_checker_reading_nothing_is_dead_weight():
-    plan = _plan([
-        {"name": "one", "nodes": [_node("a")]},
-        {"name": "two", "nodes": [_node("idle-critic", role="critic")]},
-    ])
+    plan = _plan(
+        [
+            {"name": "one", "nodes": [_node("a")]},
+            {"name": "two", "nodes": [_node("idle-critic", role="critic")]},
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="reads nothing"):
         admit(plan, DEFAULTS)
 
@@ -256,28 +303,39 @@ def test_checker_reading_nothing_is_dead_weight():
 def test_fan_out_without_fan_in_is_refused():
     """Silent duplication gets a structural home: two parallel producers with
     no later node reading BOTH means disagreements land unexamined."""
-    plan = _plan([
-        {"name": "gather", "nodes": [_node("gather-a"), _node("gather-b")]},
-        {"name": "half", "nodes": [_node("m", role="judge", reads=["gather-a"])]},
-    ])
+    plan = _plan(
+        [
+            {"name": "gather", "nodes": [_node("gather-a"), _node("gather-b")]},
+            {"name": "half", "nodes": [_node("m", role="judge", reads=["gather-a"])]},
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="no later node reads all"):
         admit(plan, DEFAULTS)
 
 
 def test_single_producer_needs_no_fan_in():
-    plan = _plan([
-        {"name": "gather", "nodes": [_node("solo")]},
-        {"name": "check", "nodes": [_node("c", role="critic", reads=["solo"])]},
-    ])
+    plan = _plan(
+        [
+            {"name": "gather", "nodes": [_node("solo")]},
+            {"name": "check", "nodes": [_node("c", role="critic", reads=["solo"])]},
+        ]
+    )
     admit(plan, DEFAULTS)
 
 
 def test_mixed_tier_producer_reads_refused_maker_neq_checker_must_derive():
-    plan = _plan([
-        {"name": "make", "nodes": [_node("fast-one", role="maker", tier="fast"),
-                                     _node("deep-one", role="maker", tier="frontier")]},
-        {"name": "check", "nodes": [_node("j", role="judge", reads=["fast-one", "deep-one"])]},
-    ])
+    plan = _plan(
+        [
+            {
+                "name": "make",
+                "nodes": [
+                    _node("fast-one", role="maker", tier="fast"),
+                    _node("deep-one", role="maker", tier="frontier"),
+                ],
+            },
+            {"name": "check", "nodes": [_node("j", role="judge", reads=["fast-one", "deep-one"])]},
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="both tiers"):
         admit(plan, DEFAULTS)
 
@@ -301,10 +359,12 @@ def test_checker_model_is_distinct_from_the_producer_it_reads():
     checker = node_model(plan, judge)
     assert checker != resolve_models().research  # distinct from what it judges
 
-    frontier_plan = _plan([
-        {"name": "make", "nodes": [_node("deep", role="maker", tier="frontier")]},
-        {"name": "check", "nodes": [_node("c", role="critic", reads=["deep"])]},
-    ])
+    frontier_plan = _plan(
+        [
+            {"name": "make", "nodes": [_node("deep", role="maker", tier="frontier")]},
+            {"name": "check", "nodes": [_node("c", role="critic", reads=["deep"])]},
+        ]
+    )
     critic = frontier_plan.phases[1].nodes[0]
     assert node_model(frontier_plan, critic) != resolve_models().maker
 
@@ -313,12 +373,19 @@ def test_checker_with_no_producer_reads_runs_the_judge_tier():
     """A judge merging critic verdicts judges judgments — it runs the JUDGE
     tier (default = the maker alias; CHIMERA_JUDGE_MODEL raises it alone),
     because the fan-in is the one place a cheap tier costs the most."""
-    plan = _plan([
-        {"name": "make", "nodes": [_node("m", role="maker", tier="frontier")]},
-        {"name": "check", "nodes": [_node("c1", role="critic", reads=["m"]),
-                                      _node("c2", role="critic", reads=["m"])]},
-        {"name": "merge", "nodes": [_node("j", role="judge", reads=["c1", "c2"])]},
-    ])
+    plan = _plan(
+        [
+            {"name": "make", "nodes": [_node("m", role="maker", tier="frontier")]},
+            {
+                "name": "check",
+                "nodes": [
+                    _node("c1", role="critic", reads=["m"]),
+                    _node("c2", role="critic", reads=["m"]),
+                ],
+            },
+            {"name": "merge", "nodes": [_node("j", role="judge", reads=["c1", "c2"])]},
+        ]
+    )
     judge = plan.phases[2].nodes[0]
     # NOT `== resolve_models().judge` — that holds for ANY lever value and so
     # can never fail (audit R-4). Assert the property that actually matters:
@@ -349,20 +416,24 @@ def test_pinned_straight_refuses_a_fan_out():
 
 
 def test_pinned_diamond_refuses_a_single_lane():
-    lane = _plan([
-        {"name": "make", "nodes": [_node("m", role="maker", tier="frontier")]},
-        {"name": "check", "nodes": [_node("c", role="critic", reads=["m"])]},
-    ])
+    lane = _plan(
+        [
+            {"name": "make", "nodes": [_node("m", role="maker", tier="frontier")]},
+            {"name": "check", "nodes": [_node("c", role="critic", reads=["m"])]},
+        ]
+    )
     with pytest.raises(GraphAdmissionError, match="pinned shape 'diamond'"):
         admit(lane, DEFAULTS, shape="diamond")
 
 
 def test_pinned_shape_admits_a_conforming_plan():
     admit(_diamond(), DEFAULTS, shape="diamond")
-    lane = _plan([
-        {"name": "make", "nodes": [_node("m", role="maker", tier="frontier")]},
-        {"name": "check", "nodes": [_node("c", role="critic", reads=["m"])]},
-    ])
+    lane = _plan(
+        [
+            {"name": "make", "nodes": [_node("m", role="maker", tier="frontier")]},
+            {"name": "check", "nodes": [_node("c", role="critic", reads=["m"])]},
+        ]
+    )
     admit(lane, DEFAULTS, shape="straight")
 
 
@@ -385,20 +456,18 @@ def test_lever_hard_caps_live_on_the_type_not_only_the_parser():
     """A GraphLevers built in code cannot exceed what the env can grant
     (audit OP-6)."""
     with pytest.raises(ValidationError):
-        GraphLevers(width_max=999, phases_max=5, call_budget=40, repair_laps=1)
+        GraphLevers(width_max=999, phases_max=5, repair_laps=1)
     with pytest.raises(ValidationError):
-        GraphLevers(width_max=3, phases_max=999, call_budget=40, repair_laps=1)
+        GraphLevers(width_max=3, phases_max=999, repair_laps=1)
     with pytest.raises(ValidationError):
-        GraphLevers(width_max=3, phases_max=5, call_budget=99999, repair_laps=1)
-    with pytest.raises(ValidationError):
-        GraphLevers(width_max=3, phases_max=5, call_budget=40, repair_laps=99)
+        GraphLevers(width_max=3, phases_max=5, repair_laps=99)
 
 
 def test_node_model_refuses_an_unadmitted_mixed_tier_plan():
     """Reaching node_model with mixed-tier producer reads means admission was
     bypassed — a domain error, not a bare tuple-unpack ValueError (audit OP-9)."""
-    from tests.arc_drivers import _gr_plan_payload
     from chimera.models import GraphPlan as _GP
+    from tests.arc_drivers import _gr_plan_payload
 
     payload = _gr_plan_payload()
     payload["phases"][0]["nodes"][0]["tier"] = "frontier"  # gather-a; gather-b stays fast

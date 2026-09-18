@@ -25,7 +25,7 @@ planner/judge share read-only):
     critic      read + web, no write      refutes; never edits what it judges
     judge       read-only                 scores and merges verdicts
 
-Since the v7 consolidation this table is the single source of tool
+Since the v7 consolidation (ADR-010) this table is the single source of tool
 grants: agents.ROSTER holds exactly one AgentDef per role and reads its
 allowed_tools from FENCES, so the roster and the fences cannot drift
 (asserted by tests/test_graph_admission.py).
@@ -91,14 +91,6 @@ class RoleFence(BaseModel):
     def can_write(self) -> bool:
         return bool(WRITE_TOOLS.intersection(self.tools))
 
-    @property
-    def has_shell(self) -> bool:
-        return bool(SHELL_TOOLS.intersection(self.tools))
-
-    @property
-    def has_network(self) -> bool:
-        return any(_is_network_tool(t) for t in self.tools)
-
     @model_validator(mode="after")
     def _no_compound_grants(self) -> RoleFence:
         check_grant(self.role, self.tools)
@@ -130,11 +122,6 @@ def fence_for(role: str) -> RoleFence:
         return FENCES[role]
     except KeyError:
         raise FenceViolation(f"unknown role {role!r} — not in the fence table") from None
-
-
-def distinct_grants() -> int:
-    """Number of distinct tool-grant sets across the fences (four today)."""
-    return len({frozenset(f.tools) for f in FENCES.values()})
 
 
 def _assert_lockstep() -> None:

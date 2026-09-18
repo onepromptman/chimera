@@ -1,9 +1,11 @@
 """All chimera schemas, as Pydantic v2 models — the single contract surface.
 
-v7 consolidation: the kernel contracts (queue, intake, verify,
+v7 consolidation (ADR-010): the kernel contracts (queue, intake, verify,
 AgentCall) plus the graph runtime's payloads. The eight retired arcs' payload
-schemas were deleted with their arcs; TaskSpec keeps their per-arc fields so
-records written before the consolidation still load.
+schemas were deleted with their arcs, and TaskSpec's nine per-arc fields
+followed on 2026-09-02 — a record written before the consolidation now
+REFUSES to load (extra="forbid") until `Queue.migrate_task_records()` strips
+them (queue.REMOVED_SPEC_FIELDS); nothing is silently tolerated and dropped.
 
 Every payload is validated by verify/schema_gate.py before any state
 transition; every model is extra="forbid".
@@ -12,8 +14,8 @@ transition; every model is extra="forbid".
 from __future__ import annotations
 
 import re
-from datetime import datetime, timezone
-from typing import ClassVar, Literal
+from datetime import UTC, datetime
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -27,7 +29,7 @@ Confidence = Field(ge=0, le=100)
 
 
 def utcnow_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 class _Strict(BaseModel):
@@ -38,21 +40,25 @@ class _Strict(BaseModel):
 # Task queue (v6)
 # ---------------------------------------------------------------------------
 
-# "graph" is the ONE live arc (v7 consolidation). The other names are
+# "graph" is the ONE live arc (v7 consolidation, ADR-010). The other names are
 # retired but stay in the Literal so task records written before the
 # consolidation still load for status/history/archive; the CLI refuses to
 # dispatch them.
 ArcName = Literal[
-    "research", "design", "proposal", "build", "reflect", "n8n", "comms",
-    "gemini", "graph",
+    "research",
+    "design",
+    "proposal",
+    "build",
+    "reflect",
+    "n8n",
+    "comms",
+    "gemini",
+    "graph",
 ]
 
 RETIRED_ARCS: frozenset[str] = frozenset(
     {"research", "design", "proposal", "build", "reflect", "n8n", "comms", "gemini"}
 )
-
-# One door: every new task is a graph task; the planner picks the shape.
-LAUNCH_ARCS: tuple[ArcName, ...] = ("graph",)
 
 # The operator's G1 shape pick (rev-2 design, 2026-08-28): the framework only
 # recommends — a five-agent design pass with an adversarial validator rejected
@@ -62,7 +68,6 @@ LAUNCH_ARCS: tuple[ArcName, ...] = ("graph",)
 GraphShape = Literal["straight", "diamond", "pipeline"]
 
 TaskState = Literal[
-    "awaiting-input",
     "ready",
     "running",
     "awaiting-signoff",
@@ -70,6 +75,7 @@ TaskState = Literal[
     "done",
     "archived",
 ]
+
 
 class TaskSpec(_Strict):
     """Immutable description of one task, fixed at G1 intake."""
@@ -79,19 +85,15 @@ class TaskSpec(_Strict):
     ask: str = Field(min_length=1)
     arc: ArcName
     context: str | None = None
-    shape: "GraphShape | None" = None  # operator's G1 pick; None = planner proposes
+    shape: GraphShape | None = None  # operator's G1 pick; None = planner proposes
     issue_number: int | None = None
-    # Legacy per-arc fields (retired arcs): kept ONLY so records
-    # written before the v7 consolidation still validate. New intake never
-    # sets them.
-    upstream: str | None = None
-    target_repo: str | None = None
-    n8n_target: str | None = None
-    audience: str | None = None
-    voice: str | None = None
-    output_kind: str | None = None
-    external_ok: bool = False
-    manifest: str | None = None
+    # The nine per-arc fields the retired pipelines carried (brand_context,
+    # upstream, target_repo, n8n_target, audience, voice, output_kind,
+    # external_ok, manifest) were deleted 2026-09-02 (P2-3 / Q8). No live code
+    # read them after ADR-010; they survived only to let pre-consolidation
+    # records validate, and `Queue.migrate_task_records()` now strips them
+    # instead (queue.REMOVED_SPEC_FIELDS). extra="forbid" means an unmigrated record
+    # REFUSES to load rather than silently dropping a field it can't honor.
     created: str = Field(default_factory=utcnow_iso)
 
 
@@ -116,28 +118,7 @@ class TaskRecord(_Strict):
 
 
 # ---------------------------------------------------------------------------
-# G1 intake (ask-once)
-# ---------------------------------------------------------------------------
-
-SocraticOutcome = Literal["proceed-top", "ask", "parallel-ab"]
-
-
-class IntakeQuestion(_Strict):
-    id: str = Field(pattern=r"^q[0-9]+$")
-    question: str = Field(min_length=1)
-    answer: str = ""
-
-
-class IntakeQuestions(_Strict):
-    """Serialized to tasks/<id>/questions.yaml exactly once (ask-once)."""
-
-    task_id: str
-    posted_at: str = Field(default_factory=utcnow_iso)
-    questions: list[IntakeQuestion] = Field(min_length=1, max_length=5)
-
-
-# ---------------------------------------------------------------------------
-# Runner audit trail (hardening counters)
+# Runner audit trail (workflow.js v2.1 hardening counters)
 # ---------------------------------------------------------------------------
 
 
@@ -160,6 +141,65 @@ class CriticOpinion(_Strict):
     reason: str
     severity: Literal["fatal", "material", "cosmetic"] | None = None
 
+    @model_validator(mode="after")
+    def _refuted_requires_a_graded_severity(self) -> CriticOpinion:
+        # severity is now load-bearing (fatal-only veto): an ungraded
+        # refutation cannot be checked against blocks() and would silently
+        # escape it. An unrefuted opinion still carries severity=None fine —
+        # there is nothing to grade.
+        if self.refuted and self.severity is None:
+            raise ValueError("refuted=true requires severity to be set (fatal/material/cosmetic)")
+        return self
+
+
+# ---------------------------------------------------------------------------
+# Seeded-mutant panel credential (C15). One deterministic defect, seeded by
+# pure Python into a COPY of the artifact and graded by one extra panel call:
+# the maker never authors its own credential. A "caught" mutant is a floor
+# raiser — it says the panel caught a seeded defect of a searched class — and
+# never a certificate. The credential NEVER gates: see verify/mutants.py.
+# ---------------------------------------------------------------------------
+
+
+class SeededDefect(_Strict):
+    """The one defect a mutant run seeds, recorded so `mutants.apply()` can
+    re-apply it deterministically without re-searching the artifact."""
+
+    operator: Literal["path-anchor", "open-finding", "quantity"]
+    defect_class: str  # "citation-path" | "deleted-disclosure" | "load-bearing-number"
+    offset: int = Field(ge=0)  # char offset of the mutation in the rendered artifact
+    original: str = Field(max_length=200)
+    mutated: str = Field(max_length=200)
+    expected_catch: str  # prose: what a catching panel must say
+    angle: int = Field(ge=1, le=2)  # which verify angle is expected to catch it
+
+
+class MutantRun(_Strict):
+    """One control dispatch, from schedule to grade.
+
+    `status` is the whole story: `pending` (scheduled, not landed), `caught`
+    (the angle refuted the seeded variant), `missed` (it did not), and
+    `not-measured` for EVERY failure path — no operator applied, a null, a
+    timeout, a garbage payload. Nothing here changes a verdict.
+    """
+
+    status: Literal["pending", "caught", "missed", "not-measured"] = "pending"
+    defect: SeededDefect | None = None
+    label: str = "verify:mutant1"
+    opinion: CriticOpinion | None = None
+    graded_fatal: bool = False
+    note: str | None = None  # why not-measured
+    at: str = Field(default_factory=utcnow_iso)
+
+
+PanelCredential = Literal[
+    "panel-uncredentialed",
+    "mutant-caught",
+    "mutant-missed",
+    "mutant-not-measured",
+]
+
+
 # lite is the only verification tier. The --tournament flag was deleted
 # 2026-07-02 (audit F1: stored but read nowhere); re-add a tier here on
 # first real high-stakes need, wired end-to-end or not at all.
@@ -179,21 +219,36 @@ class VerifyResult(_Strict):
     critic_model: str
     opinions: list[CriticOpinion]
     valid_critic_count: int
+    # opinions that did NOT refute. Informational only (fatal-only veto,
+    # 2026-09-16): there is no majority count left for this to feed — a
+    # refuted-but-non-fatal opinion is not unrefuted, but it does not fail the
+    # run either, it lands in open_findings below.
     unrefuted_count: int
+    # refutations the critic graded `cosmetic`. Informational, for the digest —
+    # like any other non-fatal refutation, they land in open_findings and
+    # change no outcome. Default 0 so records written before the field
+    # existed still load.
+    advisory_count: int = 0
+    # one entry per VALID opinion with refuted=True and severity != "fatal",
+    # formatted "[{severity}] {reason}". A fatal refutation vetoes the run
+    # instead of landing here (see verify/lite.py). Default so records written
+    # before this field existed still load (2026-09-16, fatal-only veto).
+    open_findings: list[str] = Field(default_factory=list)
+    # The seeded-mutant credential (C15). Both fields default so every record
+    # committed before the control existed still loads: an absent credential
+    # reads as `panel-uncredentialed`, never as a pass. The credential is a
+    # PROPERTY OF THE PANEL, not of the artifact, and gates nothing —
+    # `passed` above is computed from the two real critics alone.
+    panel_credential: PanelCredential = "panel-uncredentialed"
+    mutant: MutantRun | None = None
     at: str = Field(default_factory=utcnow_iso)
 
 
 # ---------------------------------------------------------------------------
-# Step output contract (every step emits confidence + recommendation)
+# Step output contract (every node output carries confidence + recommendation)
 # ---------------------------------------------------------------------------
 
 StepRecommendation = Literal["PROCEED", "PAUSE — SURFACE TO OPERATOR"]
-
-
-class StepOutput(_Strict):
-    confidence: int = Confidence
-    recommendation: StepRecommendation
-
 
 # Below this confidence, the digest flags the step for the operator (async — the arc
 # keeps running; the flag rides the task's single Issue thread + digest file).
@@ -201,10 +256,16 @@ CONFIDENCE_FLAG_THRESHOLD = 70
 
 
 # ---------------------------------------------------------------------------
-# Artifact frontmatter
+# Artifact frontmatter (flows/SPEC.md contracts)
 # ---------------------------------------------------------------------------
 
 ArtifactStatus = Literal["complete", "partial"]
+
+
+# `BrandContext` and `AestheticRegister` lived here until 2026-09-02
+# (P2-3 / Q8). They were the retired design arc's brand-token carrier, reached
+# only through `TaskSpec.brand_context`; both went with that field. Git history
+# keeps the token defaults.
 
 
 # ---------------------------------------------------------------------------
@@ -238,7 +299,7 @@ class AgentCall(_Strict):
 
 # ---------------------------------------------------------------------------
 # Graph arc payloads — the planner-emitted DAG runtime (frontier rebuild,
-# the graph-runtime design).
+# decisions/plans/2026-08-28-frontier-graph-rebuild.md).
 #
 # The DAG is DATA, the loop is CODE: a GraphPlan is a list of phases, and a
 # node may read only nodes from STRICTLY earlier phases — cycles are
@@ -311,7 +372,7 @@ class GraphPlan(_Strict):
     phases: list[GraphPhase] = Field(min_length=1, max_length=GRAPH_HARD_MAX_PHASES)
 
     @model_validator(mode="after")
-    def _unique_ids_and_phase_names(self) -> "GraphPlan":
+    def _unique_ids_and_phase_names(self) -> GraphPlan:
         names = [p.name for p in self.phases]
         if len(set(names)) != len(names):
             raise ValueError(f"duplicate phase names: {names}")
@@ -343,6 +404,17 @@ class GraphFrontmatter(_Strict):
     status: ArtifactStatus
 
 
+# The wrap body ceiling, gated HERE so an artifact the verify panel could not
+# read whole is refused at submit — the driver re-runs the maker once with the
+# error appended — instead of being truncated for the panel. Disclosure alone
+# was ignored: every wrap of the two 2026-09-16 runs (four artifacts, 52,916
+# to 57,171 chars) overran a 46,000 ask, and each panel graded a cut artifact.
+# Sized for frontier-tier critics (arcs/graph.VERIFY_PAYLOAD_MAX is this plus
+# the render overhead); every committed artifact body loads under it, which a
+# test walks, because the gate also runs when an arc-state is LOADED.
+WRAP_BODY_MAX = 94_000
+
+
 class GraphArtifact(_Strict):
     """Final graph arc output (graph-output.md frontmatter + body), packaged
     for verify + signoff."""
@@ -350,10 +422,22 @@ class GraphArtifact(_Strict):
     frontmatter: GraphFrontmatter
     body: str = Field(min_length=1)
 
+    @field_validator("body")
+    @classmethod
+    def _within_the_wrap_ceiling(cls, body: str) -> str:
+        # the message is what the maker's one retry is told; pydantic elides
+        # the value itself, so the error stays small enough to ride a prompt
+        if len(body) > WRAP_BODY_MAX:
+            raise ValueError(
+                f"body is {len(body):,} chars; the wrap ceiling is {WRAP_BODY_MAX:,} — "
+                f"cut {len(body) - WRAP_BODY_MAX:,} chars of restatement, never evidence "
+                "or open findings"
+            )
+        return body
+
 
 SCHEMA_REGISTRY: dict[str, type[BaseModel]] = {
     "CriticOpinion": CriticOpinion,
-    "StepOutput": StepOutput,
     "GraphNode": GraphNode,
     "GraphPhase": GraphPhase,
     "GraphPlan": GraphPlan,

@@ -1,8 +1,8 @@
 """Git-durable task queue — the v6 state machine.
 
-Seven states:
-    awaiting-input -> ready -> running -> awaiting-signoff -> done -> archived
-                               running -> failed -> ready | archived
+Six states:
+    ready -> running -> awaiting-signoff -> done -> archived
+                         running -> failed -> ready | archived
 
 Verification and the digest are activities *inside* `running`; they are not
 states. Every transition is a git commit (durable-state-first). `done` is
@@ -26,14 +26,48 @@ from __future__ import annotations
 import json
 import re
 import sys
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import IO, Iterator
+from typing import IO
+
+from pydantic import ValidationError
+
+from . import gitio
+from .models import (
+    TaskRecord,
+    TaskSpec,
+    TaskState,
+    Transition,
+    VerifyResult,
+    utcnow_iso,
+)
 
 # Cross-platform exclusive non-blocking file lock for the tick guard.
 # POSIX (cloud containers) use fcntl.flock; native Windows has no fcntl, so
 # fall back to msvcrt.locking with the same semantics (raise BlockingIOError
 # on contention so tick_lock maps it to QueueError identically on both).
+# The wait mode is a bounded poll on BOTH platforms: a live-but-stuck holder
+# must not block a submit — or an operator's approve — forever (a crashed
+# holder is safe either way: the kernel releases on exit).
+LOCK_WAIT_S = 60.0
+LOCK_POLL_S = 0.05
+
+
+def _poll_lock(try_acquire: Callable[[], None]) -> None:
+    import time as _time
+
+    deadline = _time.monotonic() + LOCK_WAIT_S
+    while True:
+        try:
+            try_acquire()
+            return
+        except OSError:  # BlockingIOError (POSIX) and msvcrt's OSError alike
+            if _time.monotonic() >= deadline:
+                raise QueueError("timed out waiting for the queue-state lock") from None
+            _time.sleep(LOCK_POLL_S)
+
+
 if sys.platform == "win32":
     import msvcrt
 
@@ -44,17 +78,7 @@ if sys.platform == "win32":
             raise BlockingIOError(str(exc)) from exc
 
     def _tick_lock_acquire_wait(fh: IO[str]) -> None:
-        # msvcrt has no indefinite blocking lock; poll with a bounded wait
-        # (submits hold the lock for milliseconds)
-        import time as _time
-
-        for _ in range(1200):  # ~60s ceiling
-            try:
-                msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-                return
-            except OSError:
-                _time.sleep(0.05)
-        raise QueueError("timed out waiting for the queue-state lock")
+        _poll_lock(lambda: msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1))
 
     def _tick_lock_release(fh: IO[str]) -> None:
         try:
@@ -69,36 +93,40 @@ else:
         fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
     def _tick_lock_acquire_wait(fh: IO[str]) -> None:
-        fcntl.flock(fh, fcntl.LOCK_EX)
+        _poll_lock(lambda: fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB))
 
     def _tick_lock_release(fh: IO[str]) -> None:
         fcntl.flock(fh, fcntl.LOCK_UN)
 
-from pydantic import ValidationError
 
-from . import gitio
-from .models import (
-    TaskRecord,
-    TaskSpec,
-    TaskState,
-    Transition,
-    VerifyResult,
-    utcnow_iso,
+# Spec fields deleted from TaskSpec over time. `Queue.migrate_task_records()`
+# strips them from tasks/*/task.json (no CLI verb — D2, handoff item 3: the
+# one-shot `chimera migrate-tasks` command had zero observed uses after its
+# 2026-07-02 run); until it runs, extra="forbid" makes the record REFUSE to
+# load. That is the point — no silent tolerate-and-drop on load, so a stale
+# record announces itself instead of quietly losing a field.
+REMOVED_SPEC_FIELDS = (
+    "tournament",  # removed 2026-07-02 (audit F1)
+    # The retired pipelines' per-arc fields, removed 2026-09-02 (P2-3 / Q8).
+    # `target_repo` is expected BACK as a real, read field in the build-mode
+    # ADR; this entry retires the dead legacy one, and a re-added field must be
+    # dropped from this tuple in the same change that introduces it.
+    "brand_context",
+    "upstream",
+    "target_repo",
+    "n8n_target",
+    "audience",
+    "voice",
+    "output_kind",
+    "external_ok",
+    "manifest",
 )
 
-# Spec fields removed from TaskSpec after records may have been written with
-# them. `chimera migrate-tasks` strips these one-shot; there is deliberately
-# no silent tolerate-and-drop on load (N3 amnesty rule: no permanent shims).
-REMOVED_SPEC_FIELDS = ("tournament",)  # removed 2026-07-02 (audit F1)
-
 LEGAL_TRANSITIONS: dict[TaskState, tuple[TaskState, ...]] = {
-    "awaiting-input": ("ready",),
     "ready": ("running",),
-    # running -> awaiting-input covers a mid-arc park (should be rare; G1
-    # asks once, but a hard blocker discovered mid-run parks rather than spins).
     # running -> failed is the terminal-arc exit (F7): a --null-degraded or
     # abandoned arc leaves `running` so it cannot block the tick loop.
-    "running": ("awaiting-signoff", "awaiting-input", "failed"),
+    "running": ("awaiting-signoff", "failed"),
     "awaiting-signoff": ("done", "running"),  # running = rework after G2 rejection
     "failed": ("ready", "archived"),  # ready = retry (arc state reset); archived = retire
     "done": ("archived",),
@@ -116,6 +144,20 @@ class IllegalTransition(QueueError):
 
 class VerifyGateError(QueueError):
     """Raised when a transition to done lacks a passing verification."""
+
+
+def _validation_summary(exc: ValidationError, limit: int = 5) -> str:
+    """Name the offending field(s) of a record-level ValidationError, so a
+    migration failure points at what to fix instead of at a wall of pydantic
+    output. Bounded: a record with dozens of errors reports the first few."""
+    seen: list[str] = []
+    for err in exc.errors():
+        loc = ".".join(str(part) for part in err.get("loc", ())) or "<record>"
+        entry = f"{loc} [{err.get('type', 'invalid')}]"
+        if entry not in seen:
+            seen.append(entry)
+    head = ", ".join(seen[:limit])
+    return head + (f", … (+{len(seen) - limit} more)" if len(seen) > limit else "")
 
 
 def slugify(text: str, max_words: int = 4) -> str:
@@ -156,7 +198,7 @@ class Queue:
             raise QueueError(
                 f"{task_id}: task.json does not match the current schema "
                 f"({exc.error_count()} error(s): {exc.errors()[0].get('loc')}) — if this "
-                "record predates a schema change, run `chimera migrate-tasks` once"
+                "record predates a schema change, call Queue.migrate_task_records() once"
             ) from exc
 
     def _write(self, record: TaskRecord, message: str) -> None:
@@ -168,10 +210,8 @@ class Queue:
     # -- lifecycle -----------------------------------------------------------
 
     def create(self, spec: TaskSpec, initial_state: TaskState, by: str) -> TaskRecord:
-        if initial_state not in ("awaiting-input", "ready"):
-            raise IllegalTransition(
-                f"tasks are born awaiting-input or ready, not {initial_state}"
-            )
+        if initial_state != "ready":
+            raise IllegalTransition(f"tasks are born ready, not {initial_state}")
         if self.task_path(spec.id).exists():
             raise QueueError(f"task already exists: {spec.id}")
         record = TaskRecord(
@@ -195,23 +235,52 @@ class Queue:
     def migrate_task_records(self) -> list[str]:
         """One-shot migration: strip REMOVED_SPEC_FIELDS from every
         tasks/*/task.json (raw JSON — the whole point is that these records
-        no longer validate). Returns the migrated task ids; caller commits."""
-        migrated: list[str] = []
+        no longer validate). Returns the migrated task ids; caller commits.
+
+        TWO passes, because a migration is a durable-state write (Behavioral
+        Rule 1). Pass 1 loads, strips and VALIDATES every candidate and
+        collects the rewrites in memory; pass 2 writes them all. A record that
+        still does not validate after stripping (an unknown field this
+        migration does not remove) raises QueueError naming the task and the
+        offending field(s) BEFORE any file is touched — a per-record write
+        loop left earlier records rewritten on disk with nothing committed.
+
+        Records with nothing to strip are validated too, and never rewritten:
+        a record whose ONLY problem is an unknown field wedges every queue
+        verb, so it has to surface as an error, not as an empty `migrated`
+        list with rc 0.
+        """
         if not self.tasks_dir.exists():
-            return migrated
+            return []
+        pending: list[tuple[Path, TaskRecord]] = []
         for path in sorted(self.tasks_dir.glob("*/task.json")):
-            data = json.loads(path.read_text(encoding="utf-8"))
+            task_dir = path.parent.name
+            try:
+                data = json.loads(path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as exc:
+                raise QueueError(
+                    f"tasks/{task_dir}/task.json is not valid JSON ({exc}); "
+                    "nothing was written — fix the record by hand, then re-run "
+                    "Queue.migrate_task_records()"
+                ) from exc
             spec = data.get("spec", {})
             removed = [f for f in REMOVED_SPEC_FIELDS if f in spec]
-            if not removed:
-                continue
             for field in removed:
                 spec.pop(field)
-            # validate BEFORE writing — a migration must never corrupt state
-            record = TaskRecord.model_validate(data)
+            try:
+                record = TaskRecord.model_validate(data)
+            except ValidationError as exc:
+                raise QueueError(
+                    f"tasks/{task_dir}/task.json still does not match the current "
+                    f"schema after stripping {removed or 'nothing'}: "
+                    f"{_validation_summary(exc)} — nothing was written; fix or "
+                    "remove the record by hand, then re-run Queue.migrate_task_records()"
+                ) from exc
+            if removed:
+                pending.append((path, record))
+        for path, record in pending:
             path.write_text(record.model_dump_json(indent=2) + "\n", encoding="utf-8")
-            migrated.append(path.parent.name)
-        return migrated
+        return [path.parent.name for path, _ in pending]
 
     def claim(self, task_id: str, worker: str) -> TaskRecord:
         """Claim a ready task and move it to running — single-flight per task."""
@@ -330,7 +399,7 @@ def tick_lock(root: Path, wait: bool = False) -> Iterator[None]:
 def next_runnable(queue: Queue) -> TaskRecord | None:
     """Oldest ready task with a live arc, FIFO by id (ids start with YYYYMMDD).
 
-    A pre-consolidation record whose arc was retired is never
+    A pre-consolidation record whose arc was retired (ADR-010) is never
     claimable — claiming it would crash the tick at dispatch, and one legacy
     record must not starve the loop (the F7 rule, applied to retirement).
     `retired_ready` (below) surfaces them so they are skipped loudly, not
@@ -342,8 +411,10 @@ def next_runnable(queue: Queue) -> TaskRecord | None:
 
 
 def retired_ready(queue: Queue) -> list[str]:
-    """Ready tasks that can never run because their arc was retired — the
-    operator archives them or re-opens the ask as a graph task."""
+    """Ready tasks that can never run because their arc was retired — no
+    queue-level exit remains (D3, handoff item 3). The real clearing path is
+    an operator action, not a queue verb: `git rm -r tasks/<id>` + commit;
+    re-open the ask as a graph task afterward if it still matters."""
     from .models import RETIRED_ARCS
 
     return [r.spec.id for r in queue.list_tasks("ready") if r.spec.arc in RETIRED_ARCS]

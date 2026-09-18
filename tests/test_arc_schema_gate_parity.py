@@ -1,5 +1,5 @@
 """N1 — verify-stage CriticOpinion payloads route through the schema gate in
-all seven arcs (spec §3): a malformed payload raises SchemaGateError and
+every arc in tests/arc_drivers.py::ARCS (spec §3): a malformed payload raises SchemaGateError and
 leaves state untouched; the same label accepts a valid resubmission
 afterward (state-safety, N8)."""
 

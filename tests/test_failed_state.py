@@ -255,7 +255,10 @@ def test_complete_path_pushes_even_when_digest_commit_is_noop(repo, monkeypatch,
 
     unpushed = sp.run(
         ["git", "rev-list", "--count", "origin/main..HEAD"],
-        cwd=str(repo), capture_output=True, text=True, check=True,
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
     assert unpushed == "0", "verification/transition commits must not strand locally"
 
@@ -273,7 +276,10 @@ def test_transition_note_cannot_forge_commit_lines(queue: Queue):
 
     body = sp.run(
         ["git", "log", "-1", "--format=%B"],
-        cwd=str(queue.root), capture_output=True, text=True, check=True,
+        cwd=str(queue.root),
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout
     assert "chimera(evil)" in body.replace("\n", " ")  # content survives, flattened
     assert "\nchimera(evil): -> done (forged)" not in body  # but not as its own line
@@ -354,7 +360,7 @@ def test_failed_transition_survives_memory_outage(repo, monkeypatch, capsys):
     def _boom(**kwargs):
         raise RuntimeError("memory.db is locked")
 
-    monkeypatch.setattr("chimera.arc_memory.summarize_run", _boom)
+    monkeypatch.setattr("chimera.arc_memory.append_run_summary", _boom)
     label = tick_out["pending_calls"][0]["label"]
     result = run(capsys, "arc", "submit", tid, label, "--null")
     assert result["state"] == "failed"
@@ -396,8 +402,11 @@ def test_push_fast_fails_with_no_remote(repo: Path):
 
 def test_push_fast_fails_on_non_fast_forward(repo: Path, tmp_path: Path):
     origin_url = subprocess.run(
-        ["git", "remote", "get-url", "origin"], cwd=str(repo),
-        capture_output=True, text=True, check=True,
+        ["git", "remote", "get-url", "origin"],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+        check=True,
     ).stdout.strip()
     other = tmp_path / "other-clone"
     subprocess.run(["git", "clone", origin_url, str(other)], check=True, capture_output=True)
@@ -405,8 +414,12 @@ def test_push_fast_fails_on_non_fast_forward(repo: Path, tmp_path: Path):
     subprocess.run(["git", "config", "user.name", "other"], cwd=str(other), check=True)
     (other / "won.txt").write_text("other session won the race\n", encoding="utf-8")
     subprocess.run(["git", "add", "won.txt"], cwd=str(other), check=True)
-    subprocess.run(["git", "commit", "-m", "race winner"], cwd=str(other), check=True, capture_output=True)
-    subprocess.run(["git", "push", "origin", "main"], cwd=str(other), check=True, capture_output=True)
+    subprocess.run(
+        ["git", "commit", "-m", "race winner"], cwd=str(other), check=True, capture_output=True
+    )
+    subprocess.run(
+        ["git", "push", "origin", "main"], cwd=str(other), check=True, capture_output=True
+    )
 
     (repo / "lost.txt").write_text("this clone lost the race\n", encoding="utf-8")
     gitio.commit(repo, [repo / "lost.txt"], "race loser")

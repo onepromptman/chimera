@@ -16,12 +16,12 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
-from chimera.arcs._common import expired_labels
 from chimera.arcs.graph import CALL_CEILINGS as GRAPH_CEILINGS
+from chimera.arcs.graph import expired_labels
 from chimera.models import AgentCall
 from tests.arc_drivers import (
     ARC_IDS,
@@ -49,14 +49,20 @@ class _FirstIssuedState:
 
 
 def _call(label: str, issued_at: str) -> AgentCall:
-    return AgentCall(label=label, prompt="x", schema_name="GraphNodeOutput", model="opus",
-                      phase="run", issued_at=issued_at)
+    return AgentCall(
+        label=label,
+        prompt="x",
+        schema_name="GraphNodeOutput",
+        model="opus",
+        phase="run",
+        issued_at=issued_at,
+    )
 
 
 def test_node_label_not_expired_between_default_and_work_ceiling():
     """graph's `node:` labels carry the 1800s ceiling, not the 300s default —
     at t=1000s (> 300s, < 1800s) they must NOT be expired."""
-    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    t0 = datetime(2026, 7, 1, tzinfo=UTC)
     stamp = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
     state = _FirstIssuedState({"node:gather-a": stamp})
     calls = [_call("node:gather-a", stamp)]
@@ -65,7 +71,7 @@ def test_node_label_not_expired_between_default_and_work_ceiling():
 
 
 def test_node_label_expired_past_work_ceiling():
-    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    t0 = datetime(2026, 7, 1, tzinfo=UTC)
     stamp = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
     state = _FirstIssuedState({"node:gather-a": stamp})
     calls = [_call("node:gather-a", stamp)]
@@ -78,29 +84,34 @@ def test_default_300s_ceiling_applies_to_unlisted_labels():
     300s default. plan/wrap moved to the 1800s ceiling in the 2026-08-28
     batch (audit OP-15) — a container reclaim mid-plan no longer kills the
     task on a hair trigger."""
-    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    t0 = datetime(2026, 7, 1, tzinfo=UTC)
     stamp = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
     state = _FirstIssuedState({"verify:critic1": stamp})
     calls = [_call("verify:critic1", stamp)]
-    assert expired_labels(state, calls, ceilings=GRAPH_CEILINGS,
-                           now=t0 + timedelta(seconds=200)) == []
-    assert expired_labels(state, calls, ceilings=GRAPH_CEILINGS,
-                           now=t0 + timedelta(seconds=400)) == ["verify:critic1"]
+    assert (
+        expired_labels(state, calls, ceilings=GRAPH_CEILINGS, now=t0 + timedelta(seconds=200)) == []
+    )
+    assert expired_labels(
+        state, calls, ceilings=GRAPH_CEILINGS, now=t0 + timedelta(seconds=400)
+    ) == ["verify:critic1"]
 
 
 def test_plan_and_wrap_ride_the_long_ceiling():
     """OP-15: plan/wrap are frontier-tier tool loops; they expire at the node
     ceiling (1800s), not the 300s default — and expiry there still HALTS
     (the halting class is unchanged, only the trigger is sane)."""
-    t0 = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    t0 = datetime(2026, 7, 1, tzinfo=UTC)
     stamp = t0.strftime("%Y-%m-%dT%H:%M:%SZ")
     for label in ("plan", "wrap"):
         state = _FirstIssuedState({label: stamp})
         calls = [_call(label, stamp)]
-        assert expired_labels(state, calls, ceilings=GRAPH_CEILINGS,
-                               now=t0 + timedelta(seconds=400)) == []
-        assert expired_labels(state, calls, ceilings=GRAPH_CEILINGS,
-                               now=t0 + timedelta(seconds=1900)) == [label]
+        assert (
+            expired_labels(state, calls, ceilings=GRAPH_CEILINGS, now=t0 + timedelta(seconds=400))
+            == []
+        )
+        assert expired_labels(
+            state, calls, ceilings=GRAPH_CEILINGS, now=t0 + timedelta(seconds=1900)
+        ) == [label]
 
 
 # ---------------------------------------------------------------------------
@@ -135,8 +146,11 @@ def test_aged_primary_stage_label_expires_and_halts(tmp_path, harness):
 @pytest.mark.parametrize("harness", ARCS, ids=ARC_IDS)
 def test_aged_verify_critic_label_expires_and_degrades(tmp_path, harness):
     """A timeout at a recoverable verify-critic label slots a None and does
-    NOT halt the arc — it never deadlocks; the other two critics are still
-    awaitable and the arc still completes."""
+    NOT halt the arc — it never deadlocks; the other critic is still
+    awaitable and the arc still reaches a terminal state once it lands. At
+    panel size 2 (2026-09-16) a null leaves only 1 valid opinion, so the
+    terminal state is a thin FAIL, not a pass — the degrade-not-deadlock
+    property is what this drill proves, not the outcome."""
     arc, state, _ = harness.to_verify(tmp_path)
     arc.pending_calls(state)
     set_issued_at(harness.arc_kind, state, "verify:critic1", ago(10_000))
@@ -145,8 +159,7 @@ def test_aged_verify_critic_label_expires_and_degrades(tmp_path, harness):
     assert state.phase == "verify"
     assert state.audit.agent_calls_timed_out >= 1
     state = arc.submit(state, "verify:critic2", valid_opinion(False), kind="null")
-    state = arc.submit(state, "verify:critic3", valid_opinion(False), kind="null")
-    assert state.phase == "complete"
+    assert state.phase == "failed"  # thin panel (1 valid), not a deadlock
 
 
 # ---------------------------------------------------------------------------
@@ -195,21 +208,21 @@ def test_expired_node_label_degrades_and_the_run_continues(tmp_path):
 @pytest.mark.parametrize("harness", STAGE_ARCS, ids=STAGE_ARC_IDS)
 def test_timeout_that_completes_verify_panel_finalizes_durably(tmp_path, harness):
     arc, state, task_dir = harness.to_verify(tmp_path)
-    arc.pending_calls(state)  # stamps first_issued for all three verify:criticN labels
+    arc.pending_calls(state)  # stamps first_issued for both verify:criticN labels
     state = arc.submit(state, "verify:critic1", valid_opinion(False), kind="null")
-    state = arc.submit(state, "verify:critic2", valid_opinion(False), kind="null")
-    # only verify:critic3 is still pending — the panel is not yet finalized
+    # only verify:critic2 is still pending — the panel is not yet finalized
     assert state.phase == "verify"
-    set_issued_at(harness.arc_kind, state, "verify:critic3", ago(10_000))
+    set_issued_at(harness.arc_kind, state, "verify:critic2", ago(10_000))
 
     # mimic the CLI (cmd_tick/cmd_arc_next): call expire_timeouts, then reload
     # rather than re-saving the (now stale) local `state` reference.
     expired = arc.expire_timeouts(state)
-    assert expired == ["verify:critic3"]
+    assert expired == ["verify:critic2"]
 
     fresh = arc.load()
-    # 2 valid unrefuted opinions survive proportional-majority (2 > 2/2) —
-    # the timeout is the completing event and must finalize to "complete" ON
-    # DISK, not revert to "verify".
-    assert fresh.phase == "complete"
+    # critic1 landed valid+unrefuted; critic2 timed out -> null, leaving only
+    # 1 valid opinion — too thin to pass at panel size 2. The point of this
+    # drill is that the timeout is still the COMPLETING event and must
+    # finalize durably ON DISK ("failed", not stuck reverting to "verify").
+    assert fresh.phase == "failed"
     assert (task_dir / "verification.json").exists()

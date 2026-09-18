@@ -1,6 +1,25 @@
-# CI: test harness only. This is NOT a chimera worker lane — workers are
-# Claude Code cloud sessions per TICK_PROTOCOL.md; this just keeps the
+# CI: test harness + hygiene gates. This is NOT a chimera worker lane — workers
+# are Claude Code cloud sessions per TICK_PROTOCOL.md; this just keeps the
 # framework honest on every push.
+#
+# Three jobs, all required on `main` (see CONTRIBUTING.md → branch protection):
+#   test      — the pytest matrix (3.11, 3.12), plus the pin/lock agreement
+#   lint      — ruff check, ruff format --check (src tests scripts .claude),
+#               mypy src
+#   security  — pip-audit over the hash-locked closure + gitleaks over the
+#               commits in the push/PR (secrets and this repo's boundary
+#               patterns from .gitleaks.toml)
+#
+# Lint covers `scripts` and `.claude` as well, so `pre-commit run --all-files`
+# (which sees every file) cannot be red on files CI never looked at.
+#
+# Both install from `requirements.lock` (hash-pinned, transitive included) and
+# then install the package itself with `--no-deps`, so CI resolves nothing at
+# run time except the version-pinned build backend, which PEP 517 build
+# isolation fetches from `pyproject.toml`'s `build-system.requires` outside the
+# hash-locked closure. Actions are pinned by full commit SHA — a mutable tag is
+# the standard supply-chain failure — with the tag that SHA carried as a
+# trailing comment. Dependabot proposes the bumps (.github/dependabot.yml).
 name: ci
 
 on:
@@ -8,18 +27,108 @@ on:
     branches: ["**"]
   pull_request:
 
+# Least privilege: nothing here writes to the repo.
+permissions:
+  contents: read
+
+# One in-flight run per PR (or per ref outside a PR); a new push supersedes the
+# old one. Keying on github.ref alone gave a branch push and its pull_request
+# event different groups, so every PR ran the whole matrix twice.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test:
     runs-on: ubuntu-latest
     strategy:
+      # Report both interpreters on a failure, not just the first.
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12"]
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-python@v6
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install
-        run: pip install -e ".[dev]"
+      - name: Install (locked)
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+      # `pip check` inspects what is INSTALLED for conflicting requirements. It
+      # never reads pyproject's `dev` extra, so on its own it let a bumped
+      # pytest/ruff/mypy pin sail past a lock that still carried the old one.
+      - name: Installed closure is self-consistent (pip check)
+        run: pip check
+      # The claim `pip check` cannot make: every exact pin in pyproject appears
+      # verbatim in the lock CI actually installs from. Reuses the local
+      # runner's function so the two can never drift apart.
+      - name: Pins agree with the lock
+        run: |
+          python - <<'PY'
+          import importlib.util
+          import sys
+
+          spec = importlib.util.spec_from_file_location("gates_runner", "scripts/gates.py")
+          module = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(module)
+          drift = module.lock_pin_drift()
+          if drift:
+              sys.exit("requirements.lock does not carry: " + ", ".join(drift))
+          print("requirements.lock carries every pyproject pin")
+          PY
       - name: Test
         run: python -m pytest -q
+
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: Install (locked)
+        run: |
+          pip install -r requirements.lock
+          pip install -e . --no-deps
+      # `scripts` and `.claude` are linted too: pre-commit sees every file, so
+      # anything CI skips shows up as a red hook on a clean tree.
+      - name: Ruff (lint)
+        run: ruff check src tests scripts .claude
+      # `!cancelled()` so one run reports every gate, not just the first to fail.
+      - name: Ruff (format)
+        if: ${{ !cancelled() }}
+        run: ruff format --check src tests scripts .claude
+      - name: Mypy
+        if: ${{ !cancelled() }}
+        run: mypy src
+
+  security:
+    runs-on: ubuntu-latest
+    # gitleaks-action lists the PR's commits through the API on pull_request
+    # events (push events carry the range in the payload); without this the
+    # job dies with "Resource not accessible by integration". Still read-only.
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          # gitleaks needs the commit range, not a single snapshot
+          fetch-depth: 0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+      - name: pip-audit (known CVEs in the locked closure)
+        uses: pypa/gh-action-pip-audit@1220774d901786e6f652ae159f7b6bc8fea6d266 # v1.1.0
+        with:
+          inputs: requirements.lock
+          require-hashes: true
+      - name: gitleaks (secrets + boundary patterns in the pushed commits)
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_CONFIG: .gitleaks.toml
+          GITLEAKS_ENABLE_UPLOAD_ARTIFACT: "false"
+          # personal-account repos need no license; set GITLEAKS_LICENSE as a
+          # repository secret only if this repo ever moves to an organization

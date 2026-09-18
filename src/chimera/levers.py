@@ -1,6 +1,6 @@
 """Autonomy levers — operator-added autonomy, never engine-assumed.
 
-Design rules:
+Design rules (ADR-009; ported from the icarus hardening sessions):
 
   - every lever defaults to the RESTRICTIVE value: doing nothing is the safe
     posture, and autonomy is something an operator adds deliberately
@@ -20,8 +20,17 @@ override would be the first thing reached for and the last thing reviewed.
 |-----------------------------|---------|----------|----------------------------|
 | CHIMERA_GRAPH_WIDTH         | 3       | 8        | nodes per phase            |
 | CHIMERA_GRAPH_PHASES        | 5       | 10       | phases per graph           |
-| CHIMERA_GRAPH_CALL_BUDGET   | 40      | 250      | estimated calls per run    |
 | CHIMERA_GRAPH_REPAIR_LAPS   | 1       | 3        | verify critique→rewrite laps |
+| CHIMERA_VERIFY_MUTANT_CADENCE | 5     | 50       | how OFTEN the seeded-mutant control runs (1 = every run) |
+
+(The mutant cadence lever widens FREQUENCY, never the control itself: 0 is
+outside its range, so it reads as unset like any typo — the credential cannot
+be switched off from the environment. It never gates a verdict either way.)
+
+(Estimated agent calls per run is no longer a clamped lever: admit() dropped
+the call-budget refusal 2026-09-16 — graph.estimated_calls() remains a
+REPORTED number, in the log and the planner prompt, bounded only by the hard
+runner.AGENT_CALL_CEILING every call already enforces at the submit door.)
 
 (The model levers CHIMERA_MAKER_MODEL / CHIMERA_CRITIC_MODEL /
 CHIMERA_RESEARCH_MODEL / CHIMERA_JUDGE_MODEL and the MCP grant lever
@@ -36,19 +45,21 @@ import re
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from .runner import AGENT_CALL_CEILING
-
 GRAPH_WIDTH_DEFAULT = 3
 GRAPH_WIDTH_HARD_MAX = 8
 
 GRAPH_PHASES_DEFAULT = 5
 GRAPH_PHASES_HARD_MAX = 10
 
-GRAPH_CALL_BUDGET_DEFAULT = 40
-GRAPH_CALL_BUDGET_HARD_MAX = AGENT_CALL_CEILING  # 250 — the runner aborts past this anyway
-
-GRAPH_REPAIR_LAPS_DEFAULT = 1  # mirrors arcs/_common.MAX_VERIFY_REPAIRS
+GRAPH_REPAIR_LAPS_DEFAULT = 1  # one bounded critique -> rewrite lap, then degrade
 GRAPH_REPAIR_LAPS_HARD_MAX = 3
+
+# Seeded-mutant panel credential (C15): one extra control call on one run in
+# N. The LOW bound is 1, not 0 — "off" is deliberately unreachable from the
+# environment, so a mistyped value cannot silently retire the control.
+VERIFY_MUTANT_CADENCE_DEFAULT = 5
+VERIFY_MUTANT_CADENCE_MIN = 1
+VERIFY_MUTANT_CADENCE_MAX = 50
 
 
 class GraphLevers(BaseModel):
@@ -62,7 +73,6 @@ class GraphLevers(BaseModel):
 
     width_max: int = Field(ge=1, le=GRAPH_WIDTH_HARD_MAX)
     phases_max: int = Field(ge=1, le=GRAPH_PHASES_HARD_MAX)
-    call_budget: int = Field(ge=1, le=GRAPH_CALL_BUDGET_HARD_MAX)
     repair_laps: int = Field(ge=0, le=GRAPH_REPAIR_LAPS_HARD_MAX)
 
 
@@ -81,15 +91,29 @@ def _int_lever(name: str, default: int, lo: int, hi: int) -> int:
 
 
 def graph_levers() -> GraphLevers:
-    """Read the four graph levers from the environment, now. Call-time reads
+    """Read the three graph levers from the environment, now. Call-time reads
     so a dispatcher can set a lever for one task without a restart."""
     return GraphLevers(
         width_max=_int_lever("CHIMERA_GRAPH_WIDTH", GRAPH_WIDTH_DEFAULT, 1, GRAPH_WIDTH_HARD_MAX),
-        phases_max=_int_lever("CHIMERA_GRAPH_PHASES", GRAPH_PHASES_DEFAULT, 1, GRAPH_PHASES_HARD_MAX),
-        call_budget=_int_lever(
-            "CHIMERA_GRAPH_CALL_BUDGET", GRAPH_CALL_BUDGET_DEFAULT, 1, GRAPH_CALL_BUDGET_HARD_MAX
+        phases_max=_int_lever(
+            "CHIMERA_GRAPH_PHASES", GRAPH_PHASES_DEFAULT, 1, GRAPH_PHASES_HARD_MAX
         ),
         repair_laps=_int_lever(
             "CHIMERA_GRAPH_REPAIR_LAPS", GRAPH_REPAIR_LAPS_DEFAULT, 0, GRAPH_REPAIR_LAPS_HARD_MAX
         ),
+    )
+
+
+def mutant_cadence() -> int:
+    """One run in N carries the seeded-mutant control (default 5).
+
+    Not part of GraphLevers: it dials the VERIFY panel's self-measurement, not
+    the plan's posture, and admission never reads it. `0` is out of range and
+    reads as unset, so the control cannot be switched off from the
+    environment — only made rarer (up to 1 run in 50)."""
+    return _int_lever(
+        "CHIMERA_VERIFY_MUTANT_CADENCE",
+        VERIFY_MUTANT_CADENCE_DEFAULT,
+        VERIFY_MUTANT_CADENCE_MIN,
+        VERIFY_MUTANT_CADENCE_MAX,
     )

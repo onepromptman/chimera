@@ -1,0 +1,30 @@
+{
+  "$schema": "https://code.claude.com/schemas/marketplace.json",
+  "name": "chimera",
+  "description": "Adversarial verification for work that is expensive to get wrong.",
+  "version": "1.0.0",
+  "owner": {
+    "name": "onepromptman",
+    "url": "https://github.com/onepromptman"
+  },
+  "metadata": {
+    "pluginRoot": "./plugins"
+  },
+  "plugins": [
+    {
+      "name": "chimera",
+      "source": "./plugins/chimera",
+      "description": "Six fenced role subagents plus a 2-critic REFUTE panel. One strong maker, an anchor-checking critic plus an executing confirmer in fresh context, a fatal-only veto — every other refutation is recorded as an open finding on the digest — and one bounded repair lap. Runs in whatever repo you are already in.",
+      "displayName": "Chimera",
+      "version": "1.0.0",
+      "category": "quality",
+      "license": "MIT",
+      "keywords": [
+        "verification",
+        "adversarial-review",
+        "subagents",
+        "multi-agent"
+      ]
+    }
+  ]
+}

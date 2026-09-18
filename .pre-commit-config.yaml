@@ -1,0 +1,92 @@
+# Local fast feedback: the gates CI runs, one second instead of two minutes.
+#
+#   pip install pre-commit && pre-commit install
+#   pre-commit run --all-files        # what CI will say, before you push
+#
+# The ruff and mypy hooks are CHECK-ONLY on purpose: a green hook then means a
+# green `lint` job, and nothing rewrites your files behind your back. Fix with
+# `ruff check --fix src tests` and `ruff format src tests` when you mean to.
+#
+# Versions here are pinned to the same versions as pyproject's `dev` extra —
+# bump them together, or local and CI disagree.
+repos:
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.9.6
+    hooks:
+      - id: ruff
+        name: ruff check
+        args: ["--no-fix"]
+      - id: ruff-format
+        name: ruff format --check
+        args: ["--check"]
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+        # Two trailing spaces are a hard line break in Markdown.
+        args: ["--markdown-linebreak-ext=md"]
+      - id: check-added-large-files
+        # chimera is a framework repo: datasets, wheels and DB dumps do not
+        # belong on this origin, by accident or otherwise.
+        args: ["--maxkb=500"]
+
+  # Generic credential scan + the repo-shaped rules in .gitleaks.toml (found
+  # automatically at the repo root).
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+
+  - repo: local
+    hooks:
+      # The typed half of the push boundary, pinned to the dev extra's version
+      # so `mypy src` here is the same check CI runs.
+      - id: mypy
+        name: mypy src
+        entry: mypy
+        language: python
+        additional_dependencies: ["mypy==1.15.0", "pydantic==2.13.4"]
+        args: ["src"]
+        pass_filenames: false
+        files: ^(src/|pyproject\.toml$)
+
+      # The named half of the push boundary. The employer / vendor / person
+      # tokens live in an UNTRACKED machine-local file, never in this repo:
+      #
+      #     ~/.config/chimera/leak-tokens.txt   (one regex per line, # = comment)
+      #     $CHIMERA_LEAK_TOKENS                (overrides the path)
+      #
+      # No file, no-op — a clean clone is not blocked by a list it cannot see.
+      # On a hit the hook prints FILENAMES ONLY; it never echoes the matched
+      # content into a terminal or a CI log — and grep's own stderr is dropped
+      # for the same reason, since a malformed-pattern diagnostic can quote the
+      # pattern back. That leaves grep's exit status as the only signal, so it
+      # is read explicitly: 0 = hit (fail, filenames already printed), 1 =
+      # clean, anything above 1 = a bad line in the list (fail loudly, by
+      # path). Without that last arm one malformed regex made grep exit 2, the
+      # old `if` read false, and the hook passed green — silently disabling the
+      # named half of the boundary. See CONTRIBUTING.md → "Boundary".
+      - id: boundary-tokens
+        name: boundary tokens (untracked local list)
+        language: system
+        types: [text]
+        entry: >-
+          bash -c 'L=${CHIMERA_LEAK_TOKENS:-$HOME/.config/chimera/leak-tokens.txt};
+          test -f "$L" || exit 0;
+          test "$#" -gt 0 || exit 0;
+          P=$(grep -v "^#" "$L" | grep "[^[:space:]]" | paste -sd "|" -);
+          test -n "$P" || exit 0;
+          grep -Iil -E -- "$P" "$@" 2>/dev/null;
+          rc=$?;
+          if test "$rc" -gt 1; then
+          echo "boundary-tokens: bad regex in $L" >&2;
+          exit 1;
+          fi;
+          if test "$rc" -eq 0; then
+          echo "^ boundary token matched in the file(s) above (content not shown).";
+          echo "  Work content never enters this origin — see CONTRIBUTING.md.";
+          exit 1;
+          fi;
+          exit 0' --

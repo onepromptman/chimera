@@ -15,6 +15,7 @@ backup paths are pinned too.
 
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -32,6 +33,7 @@ def _lookup(results: list[tuple[str, bool, str]], name: str) -> tuple[bool, str]
 # ---------------------------------------------------------------------------
 # Preflight
 # ---------------------------------------------------------------------------
+
 
 def test_preflight_passes_maker_checker_when_tiers_differ(
     repo: Path, monkeypatch: pytest.MonkeyPatch
@@ -64,9 +66,7 @@ def test_preflight_flags_a_non_git_root(tmp_path: Path):
     assert "not a git repo" in detail
 
 
-def test_preflight_reports_levers_and_writes_nothing(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_preflight_reports_levers_and_writes_nothing(repo: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CHIMERA_GRAPH_WIDTH", "7")
     before = sorted(p.name for p in repo.iterdir())
     _, detail = _lookup(setup_wizard.run_checks(repo), "autonomy levers")
@@ -85,6 +85,7 @@ def test_check_only_mode_creates_no_env(repo: Path, monkeypatch: pytest.MonkeyPa
 # Write safety
 # ---------------------------------------------------------------------------
 
+
 def test_init_writes_every_configured_lever(repo: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CHIMERA_MAKER_MODEL", "model-a")
     monkeypatch.setenv("CHIMERA_CRITIC_MODEL", "model-b")
@@ -100,16 +101,13 @@ def test_init_writes_every_configured_lever(repo: Path, monkeypatch: pytest.Monk
         "CHIMERA_DB_PATH",
         "CHIMERA_GRAPH_WIDTH",
         "CHIMERA_GRAPH_PHASES",
-        "CHIMERA_GRAPH_CALL_BUDGET",
         "CHIMERA_GRAPH_REPAIR_LAPS",
         "CHIMERA_RESEARCH_MCP_TOOLS",
     ):
         assert f"{key}=" in body, f"{key} missing from generated .env"
 
 
-def test_init_refuses_to_clobber_an_existing_env(
-    repo: Path, monkeypatch: pytest.MonkeyPatch
-):
+def test_init_refuses_to_clobber_an_existing_env(repo: Path, monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setenv("CHIMERA_MAKER_MODEL", "model-a")
     monkeypatch.setenv("CHIMERA_CRITIC_MODEL", "model-b")
     env = repo / ".env"
@@ -150,3 +148,42 @@ def test_generated_env_holds_no_secrets(repo: Path, monkeypatch: pytest.MonkeyPa
     body = (repo / ".env").read_text(encoding="utf-8").lower()
     for forbidden in ("api_key", "api-key", "token", "secret", "password"):
         assert forbidden not in body
+
+
+def test_identity_comes_from_the_target_repo_not_the_cwd(tmp_path, monkeypatch):
+    """`--root <elsewhere>` must stamp THAT repo's configured identity.
+
+    Regression: _git_identity() ran bare `git config user.name`, inheriting
+    the cwd, so initialising a different repo wrote the operator's identity
+    from whichever checkout they happened to be standing in.
+    """
+    target = tmp_path / "target"
+    target.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=target, check=True)
+    subprocess.run(["git", "config", "user.name", "Target Repo Owner"], cwd=target, check=True)
+
+    other = tmp_path / "other"
+    other.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=other, check=True)
+    subprocess.run(["git", "config", "user.name", "Somebody Else"], cwd=other, check=True)
+
+    monkeypatch.chdir(other)
+    setup_wizard.init(target, non_interactive=True)
+
+    assert "CHIMERA_AUTHOR=Target Repo Owner" in (target / ".env").read_text()
+
+
+def test_missing_git_remote_is_a_warning_not_a_failure(tmp_path):
+    """A remote-less repo is a legitimate install: chimera's durability is the
+    commit, and push health is reported separately by `chimera status`. A hard
+    failure here would make a fresh `git init` look broken."""
+    repo = tmp_path / "local-only"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
+
+    results = setup_wizard.run_checks(repo)
+    remote = [r for r in results if r[0] == "git remote"]
+    assert remote, "the remote check should still be reported"
+    assert remote[0][1] is True, "no remote must not fail preflight"
+    assert "never push" in remote[0][2]
+    assert all(ok for _, ok, _ in results), "a remote-less repo passes preflight"

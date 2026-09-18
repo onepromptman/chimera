@@ -1,7 +1,9 @@
-"""End-to-end dry run through the CLI — one door, one arc.
+"""End-to-end dry run through the CLI — one door, one arc (ADR-010).
 
-Scenario 1 (ambiguous ask): park + single posted question -> answer ->
-autonomous graph run via tick/submit -> digest entry -> approve -> archived.
+Scenario 1 (full lifecycle): new -> autonomous graph run via tick/submit ->
+digest entry -> auto-approve on a passing panel -> archived. An ambiguous ask
+is disambiguated in conversation BEFORE `chimera new` now — there is no async
+ask/park branch (D1, handoff item 3).
 Scenario 2 (clean ask): straight through.
 Scenario 3 (subagent flow): the six-role subagent_type flows through the CLI.
 """
@@ -54,39 +56,42 @@ def pump_until_signoff(capsys, task_id):
         assert guard < 200
         call = pending[0]
         result = run(
-            capsys, "arc", "submit", task_id, call["label"],
-            "--json", json.dumps(respond(call["label"])),
+            capsys,
+            "arc",
+            "submit",
+            task_id,
+            call["label"],
+            "--json",
+            json.dumps(respond(call["label"])),
         )
         pending = result["pending_calls"]
     return result
 
 
-def test_ambiguous_ask_full_lifecycle(repo, monkeypatch, capsys):
+def test_full_lifecycle_to_archive(repo, monkeypatch, capsys):
     monkeypatch.chdir(repo)
 
-    # G1: ambiguous -> park with ONE posted question set
+    # G1: the ask is already disambiguated (in conversation, before this
+    # call) — `chimera new` opens the task straight to `ready`.
     out = run(
-        capsys, "new", "research e-bikes maybe for commuting or touring",
-        "--outcome", "ask",
-        "--question", "Commuting or touring?", "--slug", "ebike-pick",
+        capsys,
+        "new",
+        "research e-bikes for commuting, not touring",
+        "--slug",
+        "ebike-pick",
     )
     task = out["tasks"][0]
     task_id = task["task_id"]
-    assert task["state"] == "awaiting-input"
-    assert "Commuting or touring?" in task["questions_comment"]
-
-    # tick while parked: idle (parked tasks are not runnable)
-    assert run(capsys, "tick")["action"] == "idle"
-
-    # answer -> ready
-    out = run(capsys, "answer", task_id, "--answer", "q1", "commuting")
-    assert out["state"] == "ready"
+    assert task["state"] == "ready"
 
     # autonomous run: claim + graph to completion
     result = pump_until_signoff(capsys, task_id)
     assert result["arc_phase"] == "complete"
     assert result["verification"]["passed"] is True
-    assert "/approve" in result["signoff_comment"]
+    # G2 is review-after: a passing panel auto-approves, the comment says so
+    assert "Done" in result["signoff_comment"]
+    assert "reject" in result["signoff_comment"]
+    assert "/approve" not in result["signoff_comment"]
 
     # digest flagged the low-confidence node output
     digests = list((repo / "digest").glob("*.md"))
@@ -95,9 +100,9 @@ def test_ambiguous_ask_full_lifecycle(repo, monkeypatch, capsys):
     assert "low confidence (60)" in digest_text
     assert task_id in digest_text
 
-    # G2 -> done -> archived
-    out = run(capsys, "approve", task_id)
-    assert out["state"] == "done"
+    # auto-approved -> done already; a manual approve has nothing to act on
+    assert Queue(root=repo).load(task_id).state == "done"
+    run(capsys, "approve", task_id, expect_code=1)
     out = run(capsys, "archive", task_id)
     assert out["state"] == "archived"
 
@@ -105,21 +110,24 @@ def test_ambiguous_ask_full_lifecycle(repo, monkeypatch, capsys):
     queue = Queue(root=repo)
     record = queue.load(task_id)
     assert record.state == "archived"
-    assert record.approved_by == "operator"
+    assert record.approved_by == "auto:verify-pass"
 
 
 def test_clean_ask_straight_through(repo, monkeypatch, capsys):
     monkeypatch.chdir(repo)
     out = run(
-        capsys, "new", "compare static site generators",
-        "--slug", "ssg-compare",
+        capsys,
+        "new",
+        "compare static site generators",
+        "--slug",
+        "ssg-compare",
     )
     task_id = out["tasks"][0]["task_id"]
     assert out["tasks"][0]["state"] == "ready"
     assert out["tasks"][0].get("arc", "graph") in ("graph", None) or True
     result = pump_until_signoff(capsys, task_id)
     assert result["arc_phase"] == "complete"
-    run(capsys, "approve", task_id)
+    # no approve step: the passing panel finished the task on its own
     out = run(capsys, "status")
     assert [t["state"] for t in out["tasks"]] == ["done"]
     assert [t["arc"] for t in out["tasks"]] == ["graph"]  # one door
@@ -128,7 +136,11 @@ def test_clean_ask_straight_through(repo, monkeypatch, capsys):
 def test_approve_before_arc_completes_is_blocked(repo, monkeypatch, capsys):
     monkeypatch.chdir(repo)
     out = run(
-        capsys, "new", "quick research", "--slug", "quick",
+        capsys,
+        "new",
+        "quick research",
+        "--slug",
+        "quick",
     )
     task_id = out["tasks"][0]["task_id"]
     run(capsys, "tick")
@@ -148,15 +160,41 @@ def test_role_subagents_flow_through_the_cli(repo, monkeypatch, capsys):
     assert plan_call["label"] == "plan"
     assert plan_call["subagent_type"] == "planner"
 
-    result = run(capsys, "arc", "submit", task_id, "plan",
-                 "--json", json.dumps(_gr_plan_payload()))
+    result = run(capsys, "arc", "submit", task_id, "plan", "--json", json.dumps(_gr_plan_payload()))
     gathers = {c["label"]: c for c in result["pending_calls"]}
     assert set(gathers) == {"node:gather-a", "node:gather-b"}
     assert all(c["subagent_type"] == "researcher" for c in gathers.values())
 
     for label in ("node:gather-a", "node:gather-b"):
-        result = run(capsys, "arc", "submit", task_id, label,
-                     "--json", json.dumps(respond(label)))
+        result = run(capsys, "arc", "submit", task_id, label, "--json", json.dumps(respond(label)))
     (judge_call,) = result["pending_calls"]
     assert judge_call["subagent_type"] == "judge"
     assert judge_call["model"] != gathers["node:gather-a"]["model"]  # maker != checker
+
+
+# ---------------------------------------------------------------------------
+# Absence tests (Rule 6, D1/D2 handoff item 3): the ask/park branch and the
+# one-shot migration are gone from the CLI surface outright, not just unwired.
+# ---------------------------------------------------------------------------
+
+
+def test_new_parser_rejects_outcome_and_question_flags():
+    from chimera.cli import build_parser
+
+    parser = build_parser()
+    for bad_argv in (
+        ["new", "an ask", "--outcome", "ask"],
+        ["new", "an ask", "--question", "budget?"],
+    ):
+        with pytest.raises(SystemExit) as exc:
+            parser.parse_args(bad_argv)
+        assert exc.value.code == 2  # argparse's "unrecognized arguments" exit
+
+
+def test_help_lists_neither_answer_nor_migrate_tasks():
+    from chimera.cli import build_parser
+
+    parser = build_parser()
+    subcommands = parser._subparsers._group_actions[0].choices.keys()
+    assert "answer" not in subcommands
+    assert "migrate-tasks" not in subcommands

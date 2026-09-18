@@ -1,0 +1,20 @@
+{
+  "name": "chimera",
+  "displayName": "Chimera",
+  "version": "1.0.0",
+  "description": "Adversarial verification for changes that are hard to undo: six fenced role subagents and a 2-critic REFUTE panel whose verdict is a rule, not a judgement call.",
+  "author": {
+    "name": "onepromptman",
+    "url": "https://github.com/onepromptman"
+  },
+  "homepage": "https://github.com/onepromptman/chimera",
+  "repository": "https://github.com/onepromptman/chimera",
+  "license": "MIT",
+  "keywords": [
+    "verification",
+    "adversarial-review",
+    "subagents",
+    "code-review",
+    "multi-agent"
+  ]
+}

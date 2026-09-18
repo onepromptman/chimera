@@ -1,7 +1,7 @@
 """Graph runtime — admission + compilation for planner-emitted DAGs.
 
-The synthesis of the DAG-vs-loop debate (
-the graph-runtime design): **the DAG is data, the
+The synthesis of the DAG-vs-loop debate (ADR-009,
+decisions/plans/2026-08-28-frontier-graph-rebuild.md): **the DAG is data, the
 loop is code**. A GraphPlan is phase-structured and a node may read only
 nodes from strictly earlier phases, so cycles are unrepresentable rather
 than checked. The bounded back-edges (verify critique->rewrite, one re-plan
@@ -13,8 +13,11 @@ This module is pure logic over data:
   - admit(plan, levers)  — the gate every plan passes BEFORE any node runs.
     Refusal is loud and names the lever that would widen it; admission never
     silently narrows a plan (a false positive an operator can see beats a
-    silent mutation nobody reviews).
-  - estimated_calls()    — the deterministic budget model admit() enforces.
+    silent mutation nobody reviews). Estimated call count is REPORTED, not
+    enforced here (2026-09-16) — the only binding ceiling left is the runner's
+    hard AGENT_CALL_CEILING, checked at every submit door.
+  - estimated_calls()    — the deterministic call-count estimate, logged and
+    disclosed to the planner; no longer a lever admit() clamps against.
   - node_model()         — per-node model resolution. Checker nodes derive
     DISTINCT-BY-CONSTRUCTION from the producers they read (the existing
     derive_research_critic_model rule, generalized); a checker reading
@@ -63,61 +66,55 @@ class GraphAdmissionError(RuntimeError):
 
 # The one bounded re-plan lap (admission refusal -> feed the refusal back to
 # the planner once). A constant, not a lever: convergence niceties don't get
-# operator dials.
+# operator dials. No longer pre-charged in overhead_calls() (2026-09-16): it
+# has fired 0 times across 4 real runs, so estimating for it inflated a
+# REPORTED number for behavior that doesn't happen; the re-plan BEHAVIOR
+# (admission refusal -> one feedback lap) is unchanged.
 MAX_PLAN_REPAIRS = 1
 
 # Terminal machinery every graph run carries regardless of shape: the plan
-# call, the wrap call, and the 3-critic REFUTE panel.
+# call, the wrap call, and the verify panel. Panel dropped 3 -> 2 critics
+# 2026-09-16 (tasks/20260916-optimize-dag/artifacts/graph-output.md): the
+# dropped "general REFUTE" angle was the only non-executing, non-verifying
+# one — frozen run record (tests/data/): four panels, 12 committed opinions,
+# 0 graded fatal, 3 runs failed on material-only refutations whose authors
+# wrote the conclusion survives.
 _PLAN_CALLS = 1
 _WRAP_CALLS = 1
-_VERIFY_PANEL = 3
+_VERIFY_PANEL = 2  # must equal len(verify.lite.ANGLE_ROLES)
+# The seeded-mutant control (C15), on a credentialed run only: ONE extra call,
+# dispatched at lap 0 and never re-dispatched by a repair lap — hence a
+# separate term, outside the per-lap multiplier below.
+_MUTANT_CALLS = 1
 
 
-def overhead_calls(repair_laps: int) -> int:
-    """Fixed machinery every run carries beyond its own nodes: plan (+ the
-    bounded re-plan allowance) + wrap + verify panel + the repair allowance
-    (each lap re-runs wrap and a fresh panel)."""
+def overhead_calls(repair_laps: int, mutant_calls: int = 0) -> int:
+    """Fixed machinery every run carries beyond its own nodes: plan + wrap +
+    verify panel + the repair allowance (each lap re-runs wrap and a fresh
+    panel), plus the seeded-mutant control when this run is a credentialed one
+    (`mutant_calls=1`; it defaults to 0, so every pre-existing caller's number
+    is unchanged). REPORTED only (log + planner prompt) since 2026-09-16 —
+    admit() no longer clamps a plan's estimate against it; the runner's hard
+    AGENT_CALL_CEILING is the one binding ceiling left."""
     return (
         _PLAN_CALLS
-        + MAX_PLAN_REPAIRS
         + _WRAP_CALLS
         + _VERIFY_PANEL
         + repair_laps * (_WRAP_CALLS + _VERIFY_PANEL)
+        + mutant_calls * _MUTANT_CALLS
     )
 
 
-def _exec_repair_allowance(plan: GraphPlan, repair_laps: int) -> int:
-    """Worst-case executor→maker repair calls: each executor node reading
-    maker node(s) may take up to *repair_laps* laps, each lap re-running its
-    maker reads + itself (arcs/graph.py exec-repair, approved 2026-08-28)."""
-    index = _node_index(plan)
-    total = 0
-    for phase in plan.phases:
-        for node in phase.nodes:
-            if node.role != "executor":
-                continue
-            maker_reads = sum(1 for r in node.reads if index[r][1].role == "maker")
-            if maker_reads:
-                total += repair_laps * (maker_reads + 1)
-    return total
-
-
-def estimated_calls(plan: GraphPlan, repair_laps: int) -> int:
+def estimated_calls(plan: GraphPlan, repair_laps: int, mutant_calls: int = 0) -> int:
     """Deterministic worst-case agent-call estimate for one run: the fixed
-    overhead, every planned node, and the executor→maker repair allowance."""
-    return (
-        overhead_calls(repair_laps)
-        + sum(len(p.nodes) for p in plan.phases)
-        + _exec_repair_allowance(plan, repair_laps)
-    )
+    overhead plus every planned node. No longer adds an executor->maker
+    repair allowance (2026-09-16): that edge appeared in 0 of 4 real plans
+    and its machinery was removed from arcs/graph.py (S4)."""
+    return overhead_calls(repair_laps, mutant_calls) + sum(len(p.nodes) for p in plan.phases)
 
 
 def _node_index(plan: GraphPlan) -> dict[str, tuple[int, GraphNode]]:
-    return {
-        node.id: (i, node)
-        for i, phase in enumerate(plan.phases)
-        for node in phase.nodes
-    }
+    return {node.id: (i, node) for i, phase in enumerate(plan.phases) for node in phase.nodes}
 
 
 def _producer_models(
@@ -179,37 +176,6 @@ def node_model(
     return derive_research_critic_model(maker_model, models)
 
 
-def judge_tier_warning(plan: GraphPlan) -> str | None:
-    """Warn when a READ-LESS judge would run the critic tier (audit R-4).
-
-    A judge with no producer reads merges critic verdicts, so it runs the
-    judge tier. If CHIMERA_JUDGE_MODEL is set to the critic value, that judge
-    adjudicates the critics on the critics' own model — it inherits exactly
-    the blind spots it exists to catch. It is not a maker≠checker breach (no
-    producer is involved), which is why the operator's ruling is WARN, not
-    refuse: the flag rides the digest and never blocks. Returns None when the
-    posture is fine or the plan has no read-less judge."""
-    models = resolve_models()
-    if models.judge != models.critic:
-        return None
-    offenders = [
-        node.id
-        for phase in plan.phases
-        for node in phase.nodes
-        if node.role in GRAPH_CHECKER_ROLES
-        and not _producer_models(plan, node, models)
-    ]
-    if not offenders:
-        return None
-    return (
-        f"JUDGE_TIER_SHARES_CRITIC_MODEL {','.join(offenders)}: the judge tier "
-        f"and the critic tier both resolve to {models.judge!r}, so these "
-        "read-less checkers merge critic verdicts on the model that produced "
-        "them. Set CHIMERA_JUDGE_MODEL to a distinct model to remove the "
-        "shared blind spot. This does not block the run."
-    )
-
-
 def _check_shape(plan: GraphPlan, shape: str | None) -> None:
     """The operator's G1 pick, enforced in BOTH directions; a garbled pick
     refuses loudly rather than silently unpinning (audit OP-7)."""
@@ -245,7 +211,9 @@ def _check_structure(plan: GraphPlan) -> None:
     index = _node_index(plan)
     for i, phase in enumerate(plan.phases):
         for node in phase.nodes:
-            fence_for(node.role)  # unknown role is unrepresentable via the Literal, but keep the fence lookup on the hot path
+            fence_for(
+                node.role
+            )  # unknown role is unrepresentable via the Literal, but keep the fence lookup on the hot path
             if node.role == "planner":
                 raise GraphAdmissionError(
                     f"node {node.id!r} has role 'planner' — the planner EMITS "
@@ -257,9 +225,7 @@ def _check_structure(plan: GraphPlan) -> None:
                 )
             for read in node.reads:
                 if read not in index:
-                    raise GraphAdmissionError(
-                        f"node {node.id!r} reads unknown node {read!r}"
-                    )
+                    raise GraphAdmissionError(f"node {node.id!r} reads unknown node {read!r}")
                 read_phase, _ = index[read]
                 if read_phase >= i:
                     raise GraphAdmissionError(
@@ -327,8 +293,7 @@ def _check_tiers(plan: GraphPlan) -> None:
                         derive_research_critic_model(produced_on, models)
                     except MakerCheckerViolation as exc:
                         raise GraphAdmissionError(
-                            f"checker node {node.id!r} has no admissible model: "
-                            f"{exc}"
+                            f"checker node {node.id!r} has no admissible model: {exc}"
                         ) from None
 
 
@@ -343,9 +308,7 @@ def check_admitted(plan: GraphPlan, shape: str | None = None) -> GraphPlan:
     return plan
 
 
-def admit(
-    plan: GraphPlan, levers: GraphLevers, shape: str | None = None
-) -> GraphPlan:
+def admit(plan: GraphPlan, levers: GraphLevers, shape: str | None = None) -> GraphPlan:
     """The admission gate. Raises GraphAdmissionError on refusal; returns the
     plan UNCHANGED on admission (never narrows silently). Every refusal that
     a lever could widen names that lever; a shape refusal names the G1 pick.
@@ -371,14 +334,6 @@ def admit(
 
     _check_structure(plan)
     _check_tiers(plan)
-
-    estimate = estimated_calls(plan, levers.repair_laps)
-    if estimate > levers.call_budget:
-        raise GraphAdmissionError(
-            f"plan estimates {estimate} agent calls; the current posture admits "
-            f"{levers.call_budget}. Set CHIMERA_GRAPH_CALL_BUDGET to widen this "
-            "deliberately, or plan a smaller graph."
-        )
     return plan
 
 
@@ -386,12 +341,11 @@ def admit(
 # Prompt builders
 # ---------------------------------------------------------------------------
 
-_OUTPUT_CONTRACT = (
-    'Return JSON matching GraphNodeOutput: {{"node_id": "{node_id}", '
-    '"output": str, "sources": [str], "confidence": 0-100, '
-    '"recommendation": "PROCEED" | "PAUSE — SURFACE TO OPERATOR"}}. '
-    "node_id MUST be exactly {node_id!r}."
-)
+# The SHAPE of GraphNodeOutput lives in the installed role prompts
+# (agents._NODE_OUTPUT_SHAPE), which every node call already dispatches to via
+# subagent_type. A call states only WHICH schema it owes and the one value the
+# role prompt cannot know: this node's id.
+_OUTPUT_CONTRACT = "Return JSON matching GraphNodeOutput; its node_id MUST be exactly {node_id!r}."
 
 _DEGRADED_MARKER = "(node degraded — no output returned; do not invent its content)"
 
@@ -404,9 +358,7 @@ def _artifact_block(artifacts: dict[str, str | None]) -> str:
     return "\n\n".join(parts)
 
 
-def checker_brief(
-    ask: str, rubric: str, artifacts: dict[str, str | None], node_id: str
-) -> str:
+def checker_brief(ask: str, rubric: str, artifacts: dict[str, str | None], node_id: str) -> str:
     """THE prompt builder for checker-role nodes (input-set invariant).
 
     The signature is the fence: a checker sees exactly the ask, its own
@@ -416,21 +368,16 @@ def checker_brief(
     the maker's context inherits its blind spots, so the maker's context is
     not reachable from here.
 
-    The output contract is stated in the prompt because the submission is
-    schema-gated against GraphNodeOutput: a checker never told the contract
-    answers in prose, fails the gate, and degrades to --null (2026-08-28
-    adversarial audit, OP-1)."""
+    The checker discipline and the GraphNodeOutput shape are the critic/judge
+    role prompts' job (agents._CHECKER_DISCIPLINE); the call still NAMES the
+    schema it owes, because a checker never told the contract answers in prose,
+    fails the gate, and degrades to --null (2026-08-28 adversarial audit,
+    OP-1)."""
     return (
-        "You are a chimera graph checker. Judge the artifact(s) below against "
-        "the ask, applying YOUR rubric only — ask your one question once; other "
-        "gates ask theirs.\n\n"
         f"THE ASK:\n{ask}\n\n"
         f"YOUR RUBRIC:\n{rubric}\n\n"
         f"ARTIFACTS UNDER REVIEW:\n{_artifact_block(artifacts)}\n\n"
-        "Cite evidence for every judgment (artifact anchor or fetched source). "
-        "A verdict that names no specific evidence is hand-waving. Open the "
-        "`output` field with whether the work SURVIVES your rubric or FAILS "
-        "it, then the findings.\n\n" + _OUTPUT_CONTRACT.format(node_id=node_id)
+        + _OUTPUT_CONTRACT.format(node_id=node_id)
     )
 
 
@@ -438,35 +385,22 @@ def worker_brief(
     goal: str,
     node: GraphNode,
     artifacts: dict[str, str | None],
-    priors: str = "",
-    repair_note: str = "",
 ) -> str:
     """Prompt builder for producer/executor nodes: the goal, the node's own
-    brief, and its read artifacts. Researcher discipline: every empirical
-    claim carries an anchor. *repair_note* carries an exec-repair lap's
-    context (the executor's findings for a maker; the re-check instruction
-    for the executor) — bounded laps only, never free iteration."""
-    upstream = (
-        f"\n\nUPSTREAM INPUTS:\n{_artifact_block(artifacts)}" if artifacts else ""
-    )
-    citation = (
-        "\n\nCite EVERY empirical claim with a file+anchor or a fetched URL — "
-        "a sentence with no anchor beside it is a guess, not a finding."
-        if node.role == "researcher"
-        else ""
-    )
-    priors_section = f"\n\n{priors}" if priors else ""
-    repair_section = (
-        f"\n\nREPAIR CONTEXT (bounded lap — address exactly what is reported, "
-        f"nothing else):\n{repair_note}"
-        if repair_note
-        else ""
-    )
+    brief, and its read artifacts.
+
+    Role identity, the researcher's citation discipline and the
+    GraphNodeOutput shape are the installed role prompt's job (agents.ROSTER,
+    dispatched via subagent_type); the call carries only what is specific to
+    it and names the schema it owes.
+
+    No priors block either: the L2 seed goes to the PLANNER alone, which folds
+    what matters into the node briefs it authors. Re-sending 1,500 identical
+    chars to every node was up to 15 copies of one paragraph per run."""
+    upstream = f"\n\nUPSTREAM INPUTS:\n{_artifact_block(artifacts)}" if artifacts else ""
     return (
-        f"You are a chimera graph {node.role} node (id={node.id}).\n\n"
         f"TASK GOAL:\n{goal}\n\n"
-        f"YOUR SLICE:\n{node.brief}{upstream}{citation}{priors_section}{repair_section}\n\n"
-        + _OUTPUT_CONTRACT.format(node_id=node.id)
+        f"YOUR SLICE:\n{node.brief}{upstream}\n\n" + _OUTPUT_CONTRACT.format(node_id=node.id)
     )
 
 
@@ -492,10 +426,11 @@ def subagent_for(role: str) -> tuple[str | None, str]:
 def _read_outputs(
     node: GraphNode, outputs: dict[str, GraphNodeOutput | None]
 ) -> dict[str, str | None]:
-    return {
-        read: (outputs[read].output if outputs.get(read) is not None else None)
-        for read in node.reads
-    }
+    artifacts: dict[str, str | None] = {}
+    for read in node.reads:
+        out = outputs.get(read)
+        artifacts[read] = out.output if out is not None else None
+    return artifacts
 
 
 def node_call(
@@ -505,20 +440,15 @@ def node_call(
     *,
     ask: str,
     outputs: dict[str, GraphNodeOutput | None],
-    priors: str = "",
-    repair_note: str = "",
     dispatched: Mapping[str, str] | None = None,
 ) -> AgentCall:
     """Compile one node to an AgentCall. Checker prompts go through
-    checker_brief and ONLY checker_brief (repair context is a worker concern —
-    it never reaches a checker's input set)."""
+    checker_brief and ONLY checker_brief."""
     artifacts = _read_outputs(node, outputs)
     if node.role in GRAPH_CHECKER_ROLES:
         prompt = checker_brief(ask, node.brief, artifacts, node.id)
     else:
-        prompt = worker_brief(
-            plan.goal, node, artifacts, priors=priors, repair_note=repair_note
-        )
+        prompt = worker_brief(plan.goal, node, artifacts)
     subagent, reason = subagent_for(node.role)
     return AgentCall(
         label=f"node:{node.id}",
@@ -537,13 +467,12 @@ def phase_calls(
     *,
     ask: str,
     outputs: dict[str, GraphNodeOutput | None],
-    priors: str = "",
     dispatched: Mapping[str, str] | None = None,
 ) -> list[AgentCall]:
     """AgentCalls for the current phase's not-yet-submitted nodes. The barrier
     is structural: only this phase's nodes compile, and they compile only
-    against earlier-phase outputs. *priors* (the L2 seed) reaches worker
-    nodes; checker prompts never carry it (input-set invariant)."""
+    against earlier-phase outputs. No node prompt carries the L2 priors seed —
+    it reaches the planner alone, which writes the node briefs."""
     phase = plan.phases[phase_index]
     return [
         node_call(
@@ -552,7 +481,6 @@ def phase_calls(
             node,
             ask=ask,
             outputs=outputs,
-            priors=priors,
             dispatched=dispatched,
         )
         for node in phase.nodes
@@ -560,9 +488,7 @@ def phase_calls(
     ]
 
 
-def outputs_digest(
-    plan: GraphPlan, outputs: dict[str, GraphNodeOutput | None]
-) -> str:
+def outputs_digest(plan: GraphPlan, outputs: dict[str, GraphNodeOutput | None]) -> str:
     """Phase-ordered digest of every node output — the wrap maker's input."""
     parts = []
     for phase in plan.phases:
@@ -574,7 +500,5 @@ def outputs_digest(
                 body = out.output
                 if out.sources:
                     body += f"\n\nsources: {json.dumps(out.sources)}"
-            parts.append(
-                f"## [{phase.name}] {node.id} ({node.role}, tier={node.tier})\n{body}"
-            )
+            parts.append(f"## [{phase.name}] {node.id} ({node.role}, tier={node.tier})\n{body}")
     return "\n\n".join(parts)

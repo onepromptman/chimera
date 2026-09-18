@@ -7,7 +7,7 @@ and docs since v5. Memory-search-before-draft + dedup-on-write remain law.
 
 DO NOT DELETE: 4 live invocation sites still call this exact path (CLAUDE.md
 command table, README.md, .claude/skills/checkpoint/SKILL.md,
-the checkpoint skill) — deleting it breaks those callers
+.claude/skills/framework-audit/SKILL.md) — deleting it breaks those callers
 even though all real logic lives in chimera/memory.py.
 """
 

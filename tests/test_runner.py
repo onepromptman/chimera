@@ -1,11 +1,9 @@
 """Runner policies: call ceiling, timeout detection, gap-collision guard."""
 
-from datetime import datetime, timedelta, timezone
-
 import pytest
 
 from chimera import runner
-from chimera.models import AgentCall, AuditTrail
+from chimera.models import AuditTrail
 
 
 def test_ceiling_aborts_run():
@@ -29,4 +27,4 @@ def test_null_degrade_counters():
 
 # (runner.is_timed_out was the v6 research arc's native expiry helper — deleted
 # in the 2026-08-28 optimization batch; per-call expiry lives in
-# _common.expired_labels, covered by the timeout parity suite.)
+# arcs.graph.expired_labels, covered by the timeout parity suite.)

@@ -31,7 +31,7 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import agents, levers
@@ -52,13 +52,6 @@ _LEVER_PROMPTS = [
         levers.GRAPH_PHASES_DEFAULT,
         levers.GRAPH_PHASES_HARD_MAX,
         "how deep a plan may go",
-    ),
-    (
-        "CHIMERA_GRAPH_CALL_BUDGET",
-        "Estimated agent calls per run",
-        levers.GRAPH_CALL_BUDGET_DEFAULT,
-        levers.GRAPH_CALL_BUDGET_HARD_MAX,
-        "the admission-time cost ceiling",
     ),
     (
         "CHIMERA_GRAPH_REPAIR_LAPS",
@@ -102,12 +95,19 @@ def _ask_int(prompt: str, default: int, hard_max: int, why: str) -> int:
     return value
 
 
-def _git_identity() -> str:
-    """Best-effort name for the default author, from git config."""
+def _git_identity(repo_root: Path) -> str:
+    """Best-effort name for the default author, from the TARGET repo's config.
+
+    Reads with ``-C repo_root`` rather than inheriting the cwd: `chimera init
+    --root <elsewhere>` must stamp that repo's configured identity, not
+    whichever repo the operator happens to be standing in."""
     try:
         out = subprocess.run(
-            ["git", "config", "user.name"],
-            capture_output=True, text=True, timeout=5, check=False,
+            ["git", "-C", str(repo_root), "config", "user.name"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
         )
         return out.stdout.strip()
     except (OSError, subprocess.SubprocessError):
@@ -117,6 +117,7 @@ def _git_identity() -> str:
 # ---------------------------------------------------------------------------
 # Preflight checks -- read-only, safe to run any time
 # ---------------------------------------------------------------------------
+
 
 def run_checks(repo_root: Path) -> list[tuple[str, bool, str]]:
     """Return [(check name, ok, detail)] for the current environment.
@@ -134,74 +135,96 @@ def run_checks(repo_root: Path) -> list[tuple[str, bool, str]]:
     results.append(("judge tier", True, models.judge))
 
     distinct = models.maker != models.critic
-    results.append((
-        "maker != checker",
-        distinct,
-        "maker and critic tiers differ"
-        if distinct
-        else f"BOTH are {models.maker!r} -- verify panels will refuse",
-    ))
+    results.append(
+        (
+            "maker != checker",
+            distinct,
+            "maker and critic tiers differ"
+            if distinct
+            else f"BOTH are {models.maker!r} -- verify panels will refuse",
+        )
+    )
 
     # A judge on the critic tier is legal (a read-less judge reads no
     # producer) but worth surfacing, because it is easy to do by accident.
     if models.judge == models.critic:
-        results.append((
-            "judge tier",
-            True,
-            "shares the critic tier -- legal for read-less fan-in, but a "
-            "judge that merges critic verdicts will run on their model",
-        ))
+        results.append(
+            (
+                "judge overlap",
+                True,
+                "shares the critic tier -- legal for read-less fan-in, but a "
+                "judge that merges critic verdicts will run on their model",
+            )
+        )
 
     lv = levers.graph_levers()
-    results.append((
-        "autonomy levers",
-        True,
-        f"width_max={lv.width_max} phases_max={lv.phases_max} "
-        f"call_budget={lv.call_budget} repair_laps={lv.repair_laps}",
-    ))
+    results.append(
+        (
+            "autonomy levers",
+            True,
+            f"width_max={lv.width_max} phases_max={lv.phases_max} repair_laps={lv.repair_laps}",
+        )
+    )
 
     mcp = agents.research_mcp_tools()
-    results.append((
-        "MCP network grant",
-        True,
-        ", ".join(mcp) if mcp else "none (read+web fences get no MCP tools)",
-    ))
+    results.append(
+        (
+            "MCP network grant",
+            True,
+            ", ".join(mcp) if mcp else "none (read+web fences get no MCP tools)",
+        )
+    )
 
     # Memory DB: importable and its directory writable.
     from .memory import DEFAULT_DB_PATH
 
     db = Path(os.environ.get("CHIMERA_DB_PATH") or DEFAULT_DB_PATH)
     parent_ok = db.parent.exists() or not db.parent.is_absolute()
-    results.append((
-        "memory DB",
-        True,
-        f"{db}{'' if parent_ok else '  (parent dir does not exist yet)'}",
-    ))
+    results.append(
+        (
+            "memory DB",
+            True,
+            f"{db}{'' if parent_ok else '  (parent dir does not exist yet)'}",
+        )
+    )
 
     # Git: chimera's durability is git, so a non-repo is a hard failure.
     is_repo = (repo_root / ".git").exists()
-    results.append((
-        "git repo",
-        is_repo,
-        str(repo_root) if is_repo else f"{repo_root} is not a git repo -- "
-        "chimera checkpoints every transition as a commit",
-    ))
+    results.append(
+        (
+            "git repo",
+            is_repo,
+            str(repo_root)
+            if is_repo
+            else f"{repo_root} is not a git repo -- "
+            "chimera checkpoints every transition as a commit",
+        )
+    )
 
     if is_repo:
         try:
             out = subprocess.run(
                 ["git", "-C", str(repo_root), "remote"],
-                capture_output=True, text=True, timeout=5, check=False,
+                capture_output=True,
+                text=True,
+                timeout=5,
+                check=False,
             )
             remotes = [r for r in out.stdout.split() if r]
         except (OSError, subprocess.SubprocessError):
             remotes = []
-        results.append((
-            "git remote",
-            bool(remotes),
-            ", ".join(remotes) if remotes
-            else "none -- checkpoints commit locally but never push",
-        ))
+        # Not a failure: chimera's durability is the COMMIT. A remote only
+        # decides whether those commits leave the machine, and push health is
+        # reported separately by `chimera status`.
+        results.append(
+            (
+                "git remote",
+                True,
+                ", ".join(remotes)
+                if remotes
+                else "none -- checkpoints commit locally but never push",
+            )
+        )
 
     return results
 
@@ -221,8 +244,9 @@ def print_checks(results: list[tuple[str, bool, str]]) -> bool:
 # The wizard
 # ---------------------------------------------------------------------------
 
+
 def _render_env(values: dict[str, str]) -> str:
-    stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    stamp = datetime.now(UTC).strftime("%Y-%m-%d")
     lines = [
         "# chimera configuration -- written by `chimera init`.",
         f"# Generated {stamp}. Safe to hand-edit; re-run `chimera init` to redo.",
@@ -292,7 +316,7 @@ def init(
     values: dict[str, str] = {}
 
     if non_interactive:
-        values["CHIMERA_AUTHOR"] = _git_identity() or "operator"
+        values["CHIMERA_AUTHOR"] = _git_identity(repo_root) or "operator"
         values["CHIMERA_MAKER_MODEL"] = defaults.maker
         values["CHIMERA_CRITIC_MODEL"] = defaults.critic
         values["CHIMERA_RESEARCH_MODEL"] = defaults.research
@@ -303,14 +327,31 @@ def init(
         values["CHIMERA_RESEARCH_MCP_TOOLS"] = ""
     else:
         print("1. Identity -- stamped on every gate decision and commit.")
-        values["CHIMERA_AUTHOR"] = _ask("Author name", _git_identity() or "operator")
+        values["CHIMERA_AUTHOR"] = _ask("Author name", _git_identity(repo_root) or "operator")
 
         print("\n2. Model tiers. Makers author, critics refute. These MUST differ:")
         print("   a panel whose critic runs the maker's model is not adversarial,")
         print("   and chimera refuses it rather than pretending.")
+        print()
+        print("   Each value is either a harness alias that tracks whatever is")
+        print("   current (opus, sonnet, haiku, fable) or an exact model id. An")
+        print("   alias is the better default -- it does not go stale. Pin an id")
+        print("   only when you need one specific model.")
+        print()
+        print("   To see what your endpoint actually serves:")
+        print('     curl -s "$ANTHROPIC_BASE_URL/v1/models" \\')
+        print('       -H "Authorization: Bearer $ANTHROPIC_AUTH_TOKEN"')
+        print("   (a proxy or gateway may serve a different set than the public")
+        print("   API, and an id it does not serve fails at dispatch, not here.)")
+        print()
         values["CHIMERA_MAKER_MODEL"] = _ask("Maker tier", defaults.maker)
         values["CHIMERA_CRITIC_MODEL"] = _ask("Critic tier", defaults.critic)
         values["CHIMERA_RESEARCH_MODEL"] = _ask("Research tier", defaults.research)
+        print()
+        print("   The judge tier covers the planner call and read-less fan-in")
+        print("   nodes -- one call decides the whole run's shape, so this is")
+        print("   where a frontier long-horizon tier pays for itself. Raising it")
+        print("   alone can never collapse maker != checker. Defaults to maker.")
         values["CHIMERA_JUDGE_MODEL"] = _ask(
             "Judge tier (planner + read-less fan-in)", defaults.judge
         )
@@ -329,9 +370,7 @@ def init(
         values["CHIMERA_RESEARCH_MCP_TOOLS"] = _ask("MCP tools", "")
 
     if env_path.exists() and not force:
-        backup = env_path.with_suffix(
-            f".env.bak-{datetime.now(timezone.utc).strftime('%Y%m%d%H%M%S')}"
-        )
+        backup = env_path.with_suffix(f".env.bak-{datetime.now(UTC).strftime('%Y%m%d%H%M%S')}")
         shutil.copy2(env_path, backup)
         print(f"\nExisting .env backed up to {backup.name}")
 
@@ -350,7 +389,7 @@ def init(
     print("\nNext")
     print("  1. Load the config:   set -a; . ./.env; set +a")
     print("  2. Install role files: chimera install-agents")
-    print("  3. Open a task:        chimera new \"<your ask>\"")
+    print('  3. Open a task:        chimera new "<your ask>"')
     print("  4. Drive it:           chimera tick")
     if not ok:
         print("\nSome checks failed -- fix those before the first run.")
