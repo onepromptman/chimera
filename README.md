@@ -1,5 +1,12 @@
 # chimera v7
 
+chimera runs long AI jobs for you in the background. You describe a task in
+one line; Claude Code sessions in the cloud plan it, do the work, and have
+separate reviewers try to prove the result wrong before it counts as done.
+Every step is saved to git as it happens, so if a session dies, the next one
+picks up where it stopped. It is for people who already use Claude Code and a
+terminal. If you don't code, you won't need it.
+
 Git-durable background task engine driven by **Claude Code cloud sessions on
 a subscription** — no API keys, no CI workers; the standing dispatcher is a
 cloud Routine running `chimera tick`. Boris methodology:
@@ -56,6 +63,14 @@ uv pip install --no-deps -e .
 Order matters: `uv pip sync` removes anything not in the lock, so install `pip`
 and the editable package after it.
 
+The lock already carries the test and lint tools (pytest, ruff, mypy). If you
+install some other way, install the dev extras before you run the tests, or a
+first `pytest` run fails on the missing tools:
+
+```bash
+uv pip install -e '.[dev]'
+```
+
 ### 3. Install the roles and skills for every repo
 
 ```bash
@@ -94,6 +109,18 @@ from somewhere else cannot find them.
 `chimera-dag` lives in `.claude/skills/` because it needs this checkout's engine.
 
 ## How it works
+
+```mermaid
+flowchart LR
+    A["You describe a task in one line"] --> B["A cloud Claude session picks it up"]
+    B --> C["A planner splits it into steps"]
+    C --> D["Makers do the steps"]
+    D --> E["Separate checkers try to prove it wrong"]
+    E -->|"it holds up"| F["Done, saved to git"]
+    E -->|"they doubt it"| G["It waits for your sign-off"]
+```
+
+The detail, step by step:
 
 ```
 chimera new "<ask>"            G1 — the only intake gate. Ambiguity is
@@ -183,6 +210,11 @@ read. Persona prompt files are gone; the roster is the contract.
 
 A `--shape` pick is enforced at admission: a non-conforming plan is refused
 into the re-plan lap. No pick means the planner proposes within the levers.
+
+Git calls are bounded too: every git command chimera runs is stopped after
+`CHIMERA_GIT_TIMEOUT_S` seconds (default 300; unset, non-numeric or
+non-positive means the default). A timed-out push counts as transient and is
+retried with backoff.
 
 ## Layout
 

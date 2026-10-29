@@ -54,19 +54,64 @@ def test_prove_first_workflow_exists():
     )
 
 
-def test_prove_first_workflow_parses():
+_META = re.compile(r"export const meta = \{.*?\n\}", re.DOTALL)
+
+
+def _as_runtime_module(text: str) -> str:
+    """The script the way the Workflow runtime runs it.
+
+    `meta` is a module export; everything after it is the body of an async
+    function, which is why the script may use top-level `await` and `return`.
+    Plain `node --check` on the raw file parses it as an ES module, where a
+    top-level `return` is a syntax error (Node 26 reports it), so the check
+    wraps the body first.
+
+    Evidence, stated plainly: nothing in this repo documents how the runtime
+    runs a script. The async-body shape is an assumption taken from outside
+    it: Claude Code's workflow-script reference (the body runs in an async
+    context; its examples end with a top-level `return`), and the installed
+    Claude Code 2.1.309 build read on 2026-10-28, which parses scripts with
+    top-level `return` allowed and runs the body inside an async arrow
+    function. The workflow itself ends with a top-level `return`. Re-check
+    this wrapper when the runtime changes.
+    """
+    meta = _META.search(text)
+    assert meta, "the workflow must export a `meta` block"
+    body = text[: meta.start()] + text[meta.end() :]
+    return f"{meta.group(0)}\nexport default async function workflowBody() {{\n{body}\n}}\n"
+
+
+def test_prove_first_workflow_parses(tmp_path):
     node = shutil.which("node")
     if node is None:
         pytest.skip("node is not installed; the syntax check needs a real parser")
-    proc = subprocess.run([node, "--check", str(_WORKFLOW)], capture_output=True, text=True)
+    wrapped = tmp_path / "chimera-build-mode.check.mjs"
+    wrapped.write_text(_as_runtime_module(_WORKFLOW.read_text(encoding="utf-8")), encoding="utf-8")
+    proc = subprocess.run(
+        [node, "--check", str(wrapped)], capture_output=True, text=True, timeout=60
+    )
     assert proc.returncode == 0, proc.stderr
+
+
+def test_runtime_wrapper_still_catches_syntax_errors(tmp_path):
+    """Guard the guard: a broken body must still fail the check."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is not installed; the syntax check needs a real parser")
+    broken = "export const meta = {\n  name: 'x',\n}\nconst a = (\nreturn 1\n"
+    wrapped = tmp_path / "broken.check.mjs"
+    wrapped.write_text(_as_runtime_module(broken), encoding="utf-8")
+    proc = subprocess.run(
+        [node, "--check", str(wrapped)], capture_output=True, text=True, timeout=60
+    )
+    assert proc.returncode != 0
 
 
 def test_workflow_meta_declares_the_seam_args():
     """ask + targetPath + testCommand + baseBranch + sensitivity — the target
     repo, the test run, the diff base, and the corp/personal fence."""
     text = _WORKFLOW.read_text(encoding="utf-8")
-    meta = re.search(r"export const meta = \{.*?\n\}", text, re.DOTALL)
+    meta = _META.search(text)
     assert meta, "the workflow must export a `meta` block"
     for arg in ("ask", "targetPath", "testCommand", "baseBranch", "sensitivity"):
         assert re.search(rf"\b{arg}\b", meta.group(0)), f"meta does not name the {arg!r} arg"

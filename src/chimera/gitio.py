@@ -8,12 +8,31 @@ lost work.
 
 from __future__ import annotations
 
+import os
 import subprocess
 import time
 from pathlib import Path
 
 PUSH_RETRIES = 4
 PUSH_BACKOFF_S = (2, 4, 8, 16)
+
+# Every git call is bounded, so a hung push or a stuck credential prompt
+# cannot block a tick forever. Generous on purpose: commit hooks run inside
+# `git commit`. A timeout is a transient failure (push backs off and retries).
+# CHIMERA_GIT_TIMEOUT_S overrides the default; an unset, non-numeric or
+# non-positive value means the default.
+GIT_TIMEOUT_S = 300
+GIT_TIMEOUT_ENV = "CHIMERA_GIT_TIMEOUT_S"
+
+
+def git_timeout_s() -> float:
+    raw = os.environ.get(GIT_TIMEOUT_ENV, "").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return GIT_TIMEOUT_S
+    return value if value > 0 else GIT_TIMEOUT_S
+
 
 # Failure-type classification (F8 remediation): an identical retried push
 # cannot succeed against these, so they fast-fail instead of paying the full
@@ -50,7 +69,12 @@ def repo_root(start: Path | None = None) -> Path:
 
 
 def _run(cmd: list[str], cwd: Path) -> str:
-    proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+    timeout = git_timeout_s()
+    try:
+        proc = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired as exc:
+        message = f"timed out after {timeout:g}s"
+        raise GitError(f"{' '.join(cmd)} {message}", stderr=message) from exc
     if proc.returncode != 0:
         stderr = proc.stderr.strip()
         raise GitError(f"{' '.join(cmd)} failed: {stderr}", stderr=stderr)

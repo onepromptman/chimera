@@ -33,7 +33,7 @@ that keeps a second reviewer honest. See CONTRIBUTING.md.
 
 ## Boundary check
 
-- [ ] No work content — nothing from a gitignored zone (see `.gitignore`), no personnel or export-controlled data, no client or employer specifics.
+- [ ] No work content — nothing from a gitignored zone (see `.gitignore`), no personnel or other confidential data, no client or employer specifics.
 - [ ] No secrets — no `.env`, no `.mcp.json`, no tokens, keys or credentials; nothing masked-but-present.
 - [ ] Framework paths only — this repo carries the chimera framework and nothing else, on any branch (work aimed at another repo runs in that repo).
 - [ ] `pre-commit run --all-files` is clean, gitleaks and `boundary-tokens` included.

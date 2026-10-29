@@ -20,7 +20,7 @@ older is patched — upgrade instead.
 ## The boundary rule
 
 chimera is a framework repo with a public mirror. Work content — anything from
-a gitignored zone, and any personnel or export-controlled data — never enters
+a gitignored zone, and any personnel or other confidential data — never enters
 this origin, on any branch. Protection is layered and deliberately
 path-shaped (its known residual is recorded in
 ADR-006, kept in the maintainer's private repository):

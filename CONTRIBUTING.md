@@ -7,7 +7,7 @@ of getting a change in.
 
 This origin carries the **chimera framework and nothing else — on any branch**.
 No work content, no client or employer material, no personnel or
-export-controlled data, no project that merely uses chimera. Work aimed at
+other confidential data, no project that merely uses chimera. Work aimed at
 another repo runs in *that* repo's checkout or worktree (`CLAUDE.md`
 Behavioral Rule 7). A branch is not a hiding place: branches are pushed,
 mirrored and audited like `main`.

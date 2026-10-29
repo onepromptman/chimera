@@ -1,0 +1,13 @@
+# Reviewed exceptions for the OnePromptMan leak scanner (function-core build/leak_scan.py).
+# One regex per line, matched against the flagged text only: HIT, or PATH :: HIT.
+
+# The project's own name. It is here because this public repo's own name matches a
+# private-layer rule (meant for other repos), and the private layer cannot pass without
+# it. The maintainer decides whether this exception moves to the private rules' allow list.
+^chimera$
+
+# Test fixtures, not real data: a placeholder git identity, a generic home path inside
+# recorded test output, and a deliberately odd fake operator token.
+^tests/conftest\.py$ :: ^test@chimera\.local$
+^tests/data/verification-20260904-tick-stamp-durability\.json$ :: ^/home/user$
+^tests/test_g2_token\.py$ :: ^token = "-not-a-flag-just-unlucky$

@@ -10,7 +10,7 @@ All notable changes to chimera are recorded here. The format follows
   wiring, new CLI surface).
 - **PATCH** — backward-compatible bug fix or hardening.
 
-The public mirror (`onepromptman/chimera`, not `chimera_v1` — a private secondary twin) tracks these releases. To find out whether a
+This repository (`onepromptman/chimera`) tracks these releases. To find out whether a
 newer framework version is available, compare your `pyproject.toml` `version`
 against this file's top entry (`pyproject.toml` + this file are canonical;
 git tags currently lag behind and should not be trusted for version checks).
@@ -164,6 +164,11 @@ surface deleted.
   survived — a severity gate over the proportional rule was
   tried and removed for the same reason (identical verdicts at n=3, and its
   exemption opened a tie hole at n=4). Panel call overhead drops 10 → 7.
+- **Docs.** A plain-English opening and a flow diagram in the README, a note
+  to install the `dev` extras before testing, `CHIMERA_GIT_TIMEOUT_S` in the
+  README and `.env.example`, neutral wording for the data boundary in the PR
+  template, CONTRIBUTING, SECURITY and CLAUDE.md, and the licence holder
+  spelled OnePromptMan.
 
 ### Removed
 
@@ -223,6 +228,15 @@ surface deleted.
 
 ### Fixed
 
+- **A hung git call no longer blocks a tick.** Every git call in `gitio`
+  now stops after 300 s (`CHIMERA_GIT_TIMEOUT_S` overrides it; unset,
+  non-numeric or non-positive means the default) and surfaces as a
+  `GitError`; `push()` treats a timeout as transient and backs off as before.
+- **The build-mode syntax check passes on Node 26.** The test now parses
+  `chimera-build-mode.js` the way the Workflow runtime is assumed to run it
+  (the body inside an async function), so the workflow's top-level `return`
+  is legal; a second test proves a broken body still fails. The workflow
+  itself is unchanged.
 - **First-issue stamps are committed, not just saved.** `chimera tick` and
   `chimera arc next` stamped `first_issued` into `arc-state.json` and saved
   it, but only `arc submit` followed the save with a checkpoint, so the

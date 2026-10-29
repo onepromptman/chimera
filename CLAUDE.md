@@ -30,7 +30,7 @@ repository and are not shipped in this public copy (see `decisions/README.md`).
 7. Never `subprocess.run(shell=True)`; commit-message text is sanitized.
 8. Minimal supply chain: direct deps pinned exactly (pydantic 2.13.4, pytest
    9.0.3), the full closure locked in `requirements.lock`, Actions pinned by
-   SHA. (This is a supply-chain choice, not an export-control requirement.)
+   SHA. (This is a supply-chain choice, not an outside requirement.)
 9. Nothing prints a secret today; if a surface ever does, mask to the last 4.
 
 ## Invariants (numbers here, mechanics in the docstrings)
